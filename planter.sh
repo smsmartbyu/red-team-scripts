@@ -1019,29 +1019,37 @@ if [[ ${#TARGETS[@]} -eq 1 ]]; then
   if plant_on_host "${TARGETS[0]}"; then ((PLANTED++)); else ((FAILED++)); fi
   echo ""
 else
-  # Multiple targets — run in parallel
+  # Multiple targets — run in parallel with live output
   TMPDIR=$(mktemp -d)
   trap 'rm -rf "$TMPDIR"' EXIT
+  LOCKFILE="${TMPDIR}/.output.lock"
+  touch "$LOCKFILE"
   pids=()
 
   for host in "${TARGETS[@]}"; do
     (
       trap - EXIT  # don't inherit parent's cleanup trap
-      plant_on_host "$host" > "${TMPDIR}/${host}.log" 2>&1
-      echo $? > "${TMPDIR}/${host}.rc"
+      # Capture output, then flush it atomically under lock
+      _out=$(plant_on_host "$host" 2>&1)
+      _rc=$?
+      echo $_rc > "${TMPDIR}/${host}.rc"
+      # Atomic print: lock → flush entire host block → unlock
+      (
+        flock 9
+        echo "$_out"
+        echo ""
+      ) 9>"$LOCKFILE"
     ) &
     pids+=($!)
   done
 
-  echo "[*] ${#TARGETS[@]} hosts running in parallel — waiting..."
-  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null; done
+  echo "[*] ${#TARGETS[@]} hosts running in parallel — results stream as they finish..."
   echo ""
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null; done
 
-  # Print collected output and tally results
+  # Tally results
   PLANTED=0 FAILED=0
   for host in "${TARGETS[@]}"; do
-    cat "${TMPDIR}/${host}.log"
-    echo ""
     rc=$(cat "${TMPDIR}/${host}.rc" 2>/dev/null || echo 1)
     if [[ $rc -eq 0 ]]; then ((PLANTED++)); else ((FAILED++)); fi
   done
