@@ -90,10 +90,10 @@ zero [-d | -jd] [-x] <team | all>
 
 ## planter — Beacon Planter
 
-Plants a beacon (first `.exe` in CWD) on one or all team boxes. Auto-detects golden ticket, falls back to explicit creds or DA spray. Tries multiple transfer and execution methods.
+Plants C2 binaries (`session.exe` and `beacon.exe`) on one or all team boxes. By default all `.exe` files in CWD are planted; use `-b` to specify one. Auto-detects golden ticket, falls back to explicit creds or DA spray. Tries multiple transfer and execution methods per binary.
 
 ```
-planter <team> [host] [-p password_or_hash] [-u user] [-w http_url] [-x]
+planter <team> [host] [-p password_or_hash] [-u user] [-w http_url] [-b binary] [-x]
 ```
 
 | Flag | Description |
@@ -101,6 +101,7 @@ planter <team> [host] [-p password_or_hash] [-u user] [-w http_url] [-x]
 | `-p PASS` | Password or NTLM hash |
 | `-u USER` | Specify user (default: `Administrator`) |
 | `-w URL` | Fallback HTTP URL to download beacon if file transfer fails |
+| `-b FILE` | Plant only this specific binary (e.g. `-b session.exe`) |
 | `-x` | Use internal 172.16.x.x IPs (via proxychains) |
 
 **Auth priority:** golden ticket (`team<N>.ccache`) → explicit `-p` creds → DA password spray

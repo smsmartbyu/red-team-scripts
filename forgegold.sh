@@ -110,6 +110,11 @@ gen_use_script() {
 
   cat > "$SCRIPT" <<'SCRIPT_EOF'
 #!/bin/bash
+# --- Source guard: don't let users accidentally source this ---
+if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
+  echo "[!] Don't source this — run it directly:  ./${0##*/}"
+  return 1
+fi
 SCRIPT_EOF
 
   cat >> "$SCRIPT" <<SCRIPT_EOF
@@ -368,7 +373,7 @@ while true; do
     p|P) print_commands; break ;;
     9)
       echo "[*] Dropping into bash with KRB5CCNAME exported. Type 'exit' to return."
-      bash ;;
+      bash --init-file <(echo "source ~/.bashrc 2>/dev/null; export KRB5CCNAME=\$CCACHE; [[ -f \$SCRIPT_DIR/setup.sh ]] && source \$SCRIPT_DIR/setup.sh 2>/dev/null; echo '[+] Aliases loaded — ticket active'") ;;
     0) echo "[*] Exiting."; break ;;
     *) echo "[-] Invalid choice" ;;
   esac
